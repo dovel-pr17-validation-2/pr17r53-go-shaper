@@ -1,0 +1,207 @@
+// SPDX-License-Identifier: MPL-2.0
+
+export interface IApp {
+  id: string;
+  name: string;
+  path?: string;
+  folderId?: string;
+  createdAt: string;
+  updatedAt: string;
+  createdBy?: string;
+  updatedBy?: string;
+  visibility?: "public" | "private" | "password-protected";
+  type: "dashboard" | "task" | "_folder";
+  taskInfo?: ITaskInfo;
+}
+
+interface ITaskInfo {
+  lastRunAt?: string;
+  lastRunSuccess?: boolean;
+  lastRunDuration?: number; // in milliseconds
+  nextRunAt?: string;
+  nextRunType?: string;
+}
+
+export type IDashboard = Omit<IApp, "type"> & {
+  content: string;
+};
+
+export type Column = {
+  name: string;
+  type:
+  | "year"
+  | "month"
+  | "hour"
+  | "date"
+  | "timestamp"
+  | "duration"
+  | "time"
+  | "number"
+  | "string"
+  | "boolean"
+  | "object"
+  | "struct"
+  | "map"
+  | "array"
+  | "percent";
+  nullable: boolean;
+  tag:
+  | "index"
+  | "category"
+  | "value"
+  | "label"
+  | "hint"
+  | "download"
+  | "default"
+  | "defaultFrom"
+  | "defaultTo"
+  | "compare"
+  | "trend"
+  | "color"
+  | "small"
+  | "medium"
+  | "large"
+  | "band_lower"
+  | "band_upper"
+  | "";
+};
+
+export const isTimeType = (t: Column["type"]) => {
+  return (
+    t === "year" ||
+    t === "month" ||
+    t === "hour" ||
+    t === "date" ||
+    t === "timestamp"
+  );
+};
+
+export const isDatableType = (t: Column["type"]) => {
+  return (
+    t === "year" ||
+    t === "month" ||
+    t === "hour" ||
+    t === "date" ||
+    t === "timestamp" ||
+    t === "time" ||
+    t === "duration"
+  );
+};
+
+export type GaugeCategory = {
+  from: number;
+  to: number;
+  label?: string;
+  color?: string;
+};
+
+export type MarkLine = {
+  isYAxis: boolean;
+  value: (string | number);
+  label?: string;
+};
+
+export type Result = {
+  name: string;
+  visibility?: "public" | "private" | "password-protected";
+  minTimeValue: number;
+  maxTimeValue: number;
+  reloadAt: number;
+  headerImage?: string;
+  footerLink?: string;
+  footerLinkText?: string;
+  unsetVariables?: string[];
+  css?: string;
+  sections: (
+    | {
+      type: "header";
+      title?: string;
+      subtitle?: string;
+      tooltip?: string;
+      class?: string;
+      queries: {
+        render: {
+          type:
+          | "dropdown"
+          | "dropdownMulti"
+          | "button"
+          | "datepicker"
+          | "daterangePicker"
+          | "input";
+          label?: string;
+          class?: string;
+        };
+        columns: Column[];
+        rows: (string | number | boolean)[][];
+      }[];
+    }
+    | {
+      type: "content";
+      class?: string;
+      queries: {
+        render:
+        | {
+          type:
+          | "table"
+          | "value"
+          | "placeholder"
+          | "linechart"
+          | "scatterplot"
+          | "barchartHorizontal"
+          | "barchartHorizontalStacked"
+          | "barchartVertical"
+          | "barchartVerticalStacked"
+          | "piechart"
+          | "donutchart";
+          label?: string;
+          subtitle?: string;
+          tooltip?: string;
+          class?: string;
+          link?: string;
+          linkNewTab?: boolean;
+          markLines: MarkLine[];
+        }
+        | {
+          type: "gauge";
+          label?: string;
+          subtitle?: string;
+          tooltip?: string;
+          class?: string;
+          link?: string;
+          linkNewTab?: boolean;
+          gaugeCategories: GaugeCategory[];
+        };
+        columns: Column[];
+        rows: (string | number | boolean | Record<string, any>)[][];
+      }[];
+    }
+    | {
+      type: "content";
+      class?: string;
+      queries: {
+        render: {
+          type: "boxplot";
+          label?: string;
+          subtitle?: string;
+          tooltip?: string;
+          class?: string;
+          link?: string;
+          linkNewTab?: boolean;
+          markLines: MarkLine[];
+        };
+        columns: Column[];
+        rows: (string | number | boolean | {
+          min: number;
+          max: number;
+          q1: number;
+          q2: number;
+          q3: number;
+          outliers: {
+            value: number;
+            info?: Record<string, string> | null;
+          }[];
+        })[][];
+      }[];
+    }
+  )[];
+};

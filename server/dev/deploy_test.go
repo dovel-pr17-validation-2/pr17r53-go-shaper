@@ -1,0 +1,404 @@
+// SPDX-License-Identifier: MPL-2.0
+
+package dev
+
+import (
+	"bytes"
+	"context"
+	"database/sql"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"shaper/server/api"
+	"shaper/server/comms"
+	"shaper/server/core"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/duckdb/duckdb-go/v2"
+	"github.com/jmoiron/sqlx"
+	_ "modernc.org/sqlite"
+)
+
+func setupTestApp(t *testing.T) (*core.App, func()) {
+	t.Helper()
+
+	dataDir := t.TempDir()
+	sqliteDBFile := filepath.Join(dataDir, "test.sqlite")
+	sqliteDbx, err := sqlx.Connect("sqlite", sqliteDBFile)
+	if err != nil {
+		t.Fatalf("failed to connect sqlite: %v", err)
+	}
+
+	duckdbConnector, err := duckdb.NewConnector("", nil)
+	if err != nil {
+		t.Fatalf("failed to create duckdb connector: %v", err)
+	}
+	duckdbSqlDb := sql.OpenDB(duckdbConnector)
+	duckdbSqlxDb := sqlx.NewDb(duckdbSqlDb, "duckdb")
+
+	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+
+	app, err := core.New(
+		"shaper-test",
+		"test-node",
+		"dev",
+		sqliteDbx,
+		duckdbSqlxDb,
+		":memory:",
+		"",
+		"",
+		"",
+		false,
+		"",
+		"_shaper",
+		logger,
+		"/",
+		15*time.Minute,
+		24*time.Hour,
+		7*24*time.Hour,
+		false,
+		false,
+		true, // noTasks
+		false,
+		false, // noAPIKeys
+		false, // noIngest
+		true,  // noChromeSandbox
+		"shaper.ingest.",
+		"shaper.state.",
+		"shaper-state-test-"+filepath.Base(dataDir),
+		0,
+		"shaper-config-test-"+filepath.Base(dataDir),
+		"shaper-tmp-dashboards-test-"+filepath.Base(dataDir),
+		24*time.Hour,
+		"shaper-downloads-test-"+filepath.Base(dataDir),
+		10*time.Minute,
+		"shaper-tasks-test-"+filepath.Base(dataDir),
+		"shaper.tasks.",
+		"shaper-task-queue-consumer-test-"+filepath.Base(dataDir),
+		"shaper-task-results-test-"+filepath.Base(dataDir),
+		"shaper.task-results.",
+		0,
+		"shaper.task-broadcast",
+		"",
+		"",
+		"",
+		"",
+	)
+	if err != nil {
+		t.Fatalf("failed to create app: %v", err)
+	}
+
+	natsDir := filepath.Join(dataDir, "nats")
+	c, err := comms.New(comms.Config{
+		Logger:              logger.WithGroup("nats"),
+		Host:                "127.0.0.1",
+		Port:                0,
+		JSDir:               natsDir,
+		Sqlite:              sqliteDbx,
+		IngestSubjectPrefix: "shaper.ingest.",
+	})
+	if err != nil {
+		t.Fatalf("failed to start comms: %v", err)
+	}
+
+	if err := app.Init(c.Conn); err != nil {
+		c.Close()
+		t.Fatalf("failed to init app with NATS: %v", err)
+	}
+
+	cleanup := func() {
+		app.Close()
+		c.Close()
+		sqliteDbx.Close()
+		duckdbSqlxDb.Close()
+	}
+
+	return app, cleanup
+}
+
+func TestDeployOnStartup(t *testing.T) {
+	app, cleanup := setupTestApp(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	// Test 1: non-existent directory
+	err := DeployOnStartup(ctx, app, "/non/existent/dir/path/xyz")
+	if err == nil {
+		t.Fatalf("expected error for non-existent directory")
+	}
+
+	// Test 2: valid directory with a dashboard
+	tmpDir := t.TempDir()
+	dashPath := filepath.Join(tmpDir, "sales.dashboard.sql")
+	dashContent := "-- shaperid:dash123\n\nSELECT * FROM sales;"
+	if err := os.WriteFile(dashPath, []byte(dashContent), 0o644); err != nil {
+		t.Fatalf("failed to write dashboard file: %v", err)
+	}
+
+	if err := DeployOnStartup(ctx, app, tmpDir); err != nil {
+		t.Fatalf("DeployOnStartup failed: %v", err)
+	}
+
+	// Verify dashboard in DB
+	resp, err := core.ListApps(app, ctx, core.ListAppsOptions{IncludeContent: true, Path: "/"})
+	if err != nil {
+		t.Fatalf("ListApps failed: %v", err)
+	}
+	if len(resp.Apps) != 1 {
+		t.Fatalf("expected 1 app in DB, got %d", len(resp.Apps))
+	}
+	if resp.Apps[0].ID != "dash123" {
+		t.Fatalf("expected app ID 'dash123', got %q", resp.Apps[0].ID)
+	}
+	if resp.Apps[0].Name != "sales" {
+		t.Fatalf("expected app Name 'sales', got %q", resp.Apps[0].Name)
+	}
+	if resp.Apps[0].Content != "SELECT * FROM sales;" {
+		t.Fatalf("expected stripped content, got %q", resp.Apps[0].Content)
+	}
+
+	// Test 3: re-run DeployOnStartup without changes
+	if err := DeployOnStartup(ctx, app, tmpDir); err != nil {
+		t.Fatalf("DeployOnStartup second run failed: %v", err)
+	}
+
+	// Test 4: update dashboard content locally and re-deploy
+	updatedContent := "-- shaperid:dash123\n\nSELECT id, amount FROM sales;"
+	if err := os.WriteFile(dashPath, []byte(updatedContent), 0o644); err != nil {
+		t.Fatalf("failed to update dashboard file: %v", err)
+	}
+
+	if err := DeployOnStartup(ctx, app, tmpDir); err != nil {
+		t.Fatalf("DeployOnStartup after update failed: %v", err)
+	}
+
+	resp, err = core.ListApps(app, ctx, core.ListAppsOptions{IncludeContent: true, Path: "/"})
+	if err != nil {
+		t.Fatalf("ListApps failed: %v", err)
+	}
+	if resp.Apps[0].Content != "SELECT id, amount FROM sales;" {
+		t.Fatalf("expected updated content in DB, got %q", resp.Apps[0].Content)
+	}
+}
+
+func TestDeployOnStartup_StructuredLogging(t *testing.T) {
+	app, cleanup := setupTestApp(t)
+	defer cleanup()
+
+	var logBuf bytes.Buffer
+	app.Logger = slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+
+	// Add an ignored .sql file and a valid dashboard
+	ignoredPath := filepath.Join(tmpDir, "ignored.sql")
+	if err := os.WriteFile(ignoredPath, []byte("SELECT 1;"), 0o644); err != nil {
+		t.Fatalf("failed to write file: %v", err)
+	}
+
+	dashPath := filepath.Join(tmpDir, "sales.dashboard.sql")
+	dashContent := "-- shaperid:dash123\n\nSELECT * FROM sales;"
+	if err := os.WriteFile(dashPath, []byte(dashContent), 0o644); err != nil {
+		t.Fatalf("failed to write dashboard file: %v", err)
+	}
+
+	if err := DeployOnStartup(ctx, app, tmpDir); err != nil {
+		t.Fatalf("DeployOnStartup failed: %v", err)
+	}
+
+	logs := logBuf.String()
+	if !strings.Contains(logs, `level=WARN`) || !strings.Contains(logs, `File ends with .sql`) {
+		t.Errorf("expected warning log for ignored .sql file, got:\n%s", logs)
+	}
+	if !strings.Contains(logs, `level=INFO msg="Startup deploy: applying changes" count=1`) {
+		t.Errorf("expected applying changes log, got:\n%s", logs)
+	}
+	if !strings.Contains(logs, `level=INFO msg="Deploy operation" operation=create id=dash123 path=/sales.dashboard.sql`) {
+		t.Errorf("expected deploy operation log, got:\n%s", logs)
+	}
+	if !strings.Contains(logs, `level=INFO msg="Startup deploy completed successfully"`) {
+		t.Errorf("expected completion log, got:\n%s", logs)
+	}
+
+	// Second run: no changes
+	logBuf.Reset()
+	if err := DeployOnStartup(ctx, app, tmpDir); err != nil {
+		t.Fatalf("DeployOnStartup second run failed: %v", err)
+	}
+
+	logs = logBuf.String()
+	if !strings.Contains(logs, `level=INFO msg="Startup deploy: no changes detected; apps up to date"`) {
+		t.Errorf("expected no changes log, got:\n%s", logs)
+	}
+}
+
+func TestLogDeployChanges_Format(t *testing.T) {
+	oldStdout := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("failed to create pipe: %v", err)
+	}
+	os.Stdout = w
+
+	id := "dash123"
+	name := "sales"
+	path := "/"
+	content := "SELECT 1;"
+	ops := []api.AppRequest{
+		{
+			Operation: "create",
+			Type:      "dashboard",
+			Data: api.DashboardData{
+				ID:      &id,
+				Name:    &name,
+				Path:    &path,
+				Content: &content,
+			},
+		},
+	}
+	localApps := map[string]LocalApp{
+		"dash123": {
+			ID:   "dash123",
+			Name: "sales",
+			Path: "/",
+			Type: "dashboard",
+		},
+	}
+	remoteApps := map[string]api.App{}
+
+	logDeployChanges(ops, localApps, remoteApps)
+
+	w.Close()
+	os.Stdout = oldStdout
+
+	var buf bytes.Buffer
+	if _, err := buf.ReadFrom(r); err != nil {
+		t.Fatalf("failed to read buffer: %v", err)
+	}
+	out := buf.String()
+
+	expected := "create dash123: /sales.dashboard.sql\n"
+	if out != expected {
+		t.Errorf("expected %q, got %q", expected, out)
+	}
+}
+
+func TestAdminUserAutoGeneratedOnStartup(t *testing.T) {
+	dataDir := t.TempDir()
+	sqliteDBFile := filepath.Join(dataDir, "test.sqlite")
+	sqliteDbx, err := sqlx.Connect("sqlite", sqliteDBFile)
+	if err != nil {
+		t.Fatalf("failed to connect sqlite: %v", err)
+	}
+	defer sqliteDbx.Close()
+
+	duckdbConnector, err := duckdb.NewConnector("", nil)
+	if err != nil {
+		t.Fatalf("failed to create duckdb connector: %v", err)
+	}
+	duckdbSqlDb := sql.OpenDB(duckdbConnector)
+	duckdbSqlxDb := sqlx.NewDb(duckdbSqlDb, "duckdb")
+	defer duckdbSqlxDb.Close()
+
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+
+	app, err := core.New(
+		"shaper-test",
+		"test-node",
+		"dev",
+		sqliteDbx,
+		duckdbSqlxDb,
+		":memory:",
+		"",
+		"",
+		"",
+		false,
+		"",
+		"_shaper",
+		logger,
+		"/",
+		15*time.Minute,
+		24*time.Hour,
+		7*24*time.Hour,
+		false,
+		false,
+		true,
+		false,
+		false,
+		false,
+		true,
+		"shaper.ingest.",
+		"shaper.state.",
+		"shaper-state-admin-test-"+filepath.Base(dataDir),
+		0,
+		"shaper-config-admin-test-"+filepath.Base(dataDir),
+		"shaper-tmp-dashboards-admin-test-"+filepath.Base(dataDir),
+		24*time.Hour,
+		"shaper-downloads-admin-test-"+filepath.Base(dataDir),
+		10*time.Minute,
+		"shaper-tasks-admin-test-"+filepath.Base(dataDir),
+		"shaper.tasks.",
+		"shaper-task-queue-consumer-admin-test-"+filepath.Base(dataDir),
+		"shaper-task-results-admin-test-"+filepath.Base(dataDir),
+		"shaper.task-results.",
+		0,
+		"shaper.task-broadcast",
+		"",
+		"",
+		"Admin@Example.com",
+		"super-secret-password",
+	)
+	if err != nil {
+		t.Fatalf("failed to create app: %v", err)
+	}
+
+	// LoginRequired must be true immediately after core.New, even before Init creates the user
+	if !app.LoginRequired {
+		t.Fatal("expected LoginRequired to be true when admin-email is configured")
+	}
+	if strings.Contains(logBuf.String(), "No users found. Authentication is disabled") {
+		t.Fatal("expected no warning about disabled authentication when admin-email is configured")
+	}
+
+	natsDir := filepath.Join(dataDir, "nats")
+	c, err := comms.New(comms.Config{
+		Logger:              logger.WithGroup("nats"),
+		Host:                "127.0.0.1",
+		Port:                0,
+		JSDir:               natsDir,
+		Sqlite:              sqliteDbx,
+		IngestSubjectPrefix: "shaper.ingest.",
+	})
+	if err != nil {
+		t.Fatalf("failed to start comms: %v", err)
+	}
+	defer c.Close()
+
+	if err := app.Init(c.Conn); err != nil {
+		t.Fatalf("failed to init app with NATS: %v", err)
+	}
+	defer app.Close()
+
+	ctx := context.Background()
+
+	// Verify admin user was created and can log in
+	sessionToken, err := core.Login(app, ctx, "admin@example.com", "super-secret-password")
+	if err != nil {
+		t.Fatalf("expected login to succeed for auto-generated admin user, got error: %v", err)
+	}
+	if sessionToken == "" {
+		t.Fatal("expected non-empty session token")
+	}
+
+	// Calling CreateAdminUser again (or re-running Init on restart) should be idempotent
+	_, err = core.CreateAdminUser(app, ctx, "other@example.com", "other-pass", "Other")
+	if err != core.ErrUserSetupCompleted {
+		t.Fatalf("expected ErrUserSetupCompleted when creating second admin user, got: %v", err)
+	}
+}
+

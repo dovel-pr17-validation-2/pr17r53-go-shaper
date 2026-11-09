@@ -1,0 +1,424 @@
+// SPDX-License-Identifier: MPL-2.0
+
+import { Button } from "../components/tremor/Button";
+import {
+  Dialog,
+  DialogClose,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "../components/tremor/Dialog";
+import { Input } from "../components/tremor/Input";
+import { Label } from "../components/tremor/Label";
+import { useState } from "react";
+import {
+  createFileRoute,
+  isRedirect,
+  redirect,
+  useNavigate,
+  useRouter,
+} from "@tanstack/react-router";
+import { getSystemConfig } from "../lib/system";
+import { useToast } from "../hooks/useToast";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeaderCell,
+  TableRoot,
+  TableRow,
+} from "../components/tremor/Table";
+import { useQueryApi } from "../hooks/useQueryApi";
+import {
+  RiAddFill,
+  RiArrowDownSLine,
+  RiKeyFill,
+  RiTableFill,
+} from "@remixicon/react";
+import { Tooltip } from "../components/tremor/Tooltip";
+import {
+  DropdownMenu,
+  DropdownMenuCheckboxItem,
+  DropdownMenuContent,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "../components/tremor/DropdownMenu";
+
+interface APIKey {
+  id: string;
+  name: string;
+  permissions: string[];
+  createdAt: string;
+}
+
+const PERMISSIONS = [
+  { label: "Generate JWT", value: "jwt" },
+  { label: "Deploy", value: "deploy" },
+  { label: "Dry-Run Deploy", value: "deploy:dry-run" },
+  { label: "Query Data", value: "data:query" },
+  { label: "Ingest Data", value: "data:ingest" },
+  { label: "Read Metrics", value: "metrics" },
+  { label: "Read Dashboard", value: "dashboard:read" },
+  { label: "Read Database Schema", value: "schema:read" },
+];
+
+interface NewAPIKeyResponse {
+  id: string;
+  key: string;
+}
+
+type APIKeysResponse = {
+  keys: APIKey[];
+};
+
+export const Route = createFileRoute("/admin/keys")({
+  loader: async ({ context: { queryApi } }) => {
+    const config = getSystemConfig();
+    if (!config.apiKeysEnabled) {
+      throw redirect({
+        to: !config.ssoLoginUrl ? "/admin" : !config.jwtSecretStatic ? "/admin/security" : "/",
+      });
+    }
+    return queryApi("keys") as Promise<APIKeysResponse>;
+  },
+  component: Admin,
+});
+
+function Admin () {
+  const config = getSystemConfig();
+  const availablePermissions = PERMISSIONS.filter(
+    (p) => p.value !== "data:ingest" || config.ingestEnabled,
+  );
+  const data = Route.useLoaderData();
+  const [showNewKeyDialog, setShowNewKeyDialog] = useState(false);
+  const [newKey, setNewKey] = useState<NewAPIKeyResponse | null>(null);
+  const [deleteKeyDialog, setDeleteKeyDialog] = useState<APIKey | null>(null);
+  const queryApi = useQueryApi();
+  const navigate = useNavigate({ from: "/admin" });
+  const router = useRouter();
+  const { toast } = useToast();
+
+  const handleDelete = async (key: APIKey) => {
+    try {
+      await queryApi(`keys/${key.id}`, {
+        method: "DELETE",
+      });
+      toast({
+        title: "Success",
+        description: "API key deleted successfully",
+      });
+      router.invalidate();
+    } catch (error) {
+      if (isRedirect(error)) {
+        return navigate(error.options);
+      }
+      toast({
+        title: "Error",
+        description:
+          error instanceof Error
+            ? error.message
+            : "An error occurred",
+        variant: "error",
+      });
+    }
+  };
+
+  const handleCreateKey = async (name: string, permissions: string[]) => {
+    try {
+      const data = await queryApi("keys", {
+        method: "POST",
+        body: { name, permissions },
+      });
+      setNewKey(data);
+      router.invalidate();
+    } catch (error) {
+      if (isRedirect(error)) {
+        return navigate(error.options);
+      }
+      toast({
+        title: "Error",
+        description:
+          error instanceof Error
+            ? error.message
+            : "An error occurred",
+        variant: "error",
+      });
+    }
+  };
+
+  const handleUpdatePermissions = async (key: APIKey, permission: string) => {
+    const newPermissions = key.permissions.includes(permission)
+      ? key.permissions.filter((p) => p !== permission)
+      : [...key.permissions, permission];
+
+    try {
+      await queryApi(`keys/${key.id}/permissions`, {
+        method: "POST",
+        body: { permissions: newPermissions },
+      });
+      router.invalidate();
+    } catch (error) {
+      if (isRedirect(error)) {
+        return navigate(error.options);
+      }
+      toast({
+        title: "Error",
+        description:
+          error instanceof Error
+            ? error.message
+            : "An error occurred",
+        variant: "error",
+      });
+    }
+  };
+
+  return (
+    <div>
+      <div className="flex justify-between items-center mb-4">
+        <h2 className="text-xl font-semibold mb-4">
+          <RiKeyFill className="size-4 inline mr-1 -mt-0.5" />
+          API Keys
+        </h2>
+        <Button onClick={() => setShowNewKeyDialog(true)}>
+          <RiAddFill
+            className="-ml-1 mr-0.5 size-4 shrink-0"
+            aria-hidden={true}
+          />
+          New
+        </Button>
+      </div>
+
+      {!data ? (
+        <p>Loading API keys...</p>
+      ) : data.keys.length === 0 ? (
+        <div className="mt-4 flex flex-col h-44 items-center justify-center rounded-sm p-4 text-center">
+          <RiTableFill
+            className="text-ctext2 dark:text-dtext2 mx-auto h-7 w-7"
+            aria-hidden={true}
+          />
+          <p className="mt-2 text-ctext2 dark:text-dtext2 font-medium">
+            No API keys found
+          </p>
+        </div>
+      ) : (
+        <TableRoot>
+          <Table>
+            <TableHead>
+              <TableRow className="bg-cbgs dark:bg-dbgs">
+                <TableHeaderCell className="text-md text-ctext dark:text-dtext">Name</TableHeaderCell>
+                <TableHeaderCell className="text-md text-ctext dark:text-dtext hidden md:table-cell">Created</TableHeaderCell>
+                <TableHeaderCell className="text-md text-ctext dark:text-dtext">Permissions</TableHeaderCell>
+                <TableHeaderCell>Actions</TableHeaderCell>
+              </TableRow>
+            </TableHead>
+            <TableBody>
+              {data.keys.map((key) => (
+                <TableRow key={key.id}>
+                  <TableCell className="font-medium text-ctext dark:text-dtext">
+                    {key.name}
+                  </TableCell>
+                  <TableCell className="font-medium text-ctext dark:text-dtext hidden md:table-cell">
+                    <Tooltip
+                      showArrow={false}
+                      content={new Date(key.createdAt).toLocaleString()}
+                    >
+                      {new Date(key.createdAt).toLocaleDateString()}
+                    </Tooltip>
+                  </TableCell>
+                  <TableCell>
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <Button
+                          variant="secondary"
+                          className="flex items-center gap-1 py-1 my-0"
+                        >
+                          {key.permissions?.length ?? 0} Permissions
+                          <RiArrowDownSLine className="size-4" />
+                        </Button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="start">
+                        <DropdownMenuLabel>Manage Permissions</DropdownMenuLabel>
+                        <DropdownMenuSeparator />
+                        {availablePermissions.map((perm) => (
+                          <DropdownMenuCheckboxItem
+                            key={perm.value}
+                            checked={key.permissions?.includes(perm.value) ?? false}
+                            onCheckedChange={() =>
+                              handleUpdatePermissions(key, perm.value)
+                            }
+                          >
+                            <div className="flex gap-6 w-full justify-between items-end">
+                              <span>{perm.label}</span>
+                              <span className="font-mono text-xs text-ctext2">{perm.value}</span>
+                            </div>
+                          </DropdownMenuCheckboxItem>
+                        ))}
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                  </TableCell>
+                  <TableCell>
+                    <button
+                      className="text-cerr dark:text-derr hover:text-cerra dark:hover:text-derra hover:underline"
+                      onClick={() => setDeleteKeyDialog(key)}
+                    >
+                      Delete
+                    </button>
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </TableRoot>
+      )
+      }
+
+      <Dialog open={deleteKeyDialog !== null} onOpenChange={(open) => !open && setDeleteKeyDialog(null)}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Confirm Deletion</DialogTitle>
+            <DialogDescription>
+              {deleteKeyDialog && ("Are you sure you want to delete this API key \"%%\"?").replace(
+                "%%",
+                deleteKeyDialog.name,
+              )}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button onClick={() => setDeleteKeyDialog(null)} variant="secondary">Cancel</Button>
+            <Button
+              variant="destructive"
+              onClick={() => {
+                if (deleteKeyDialog) {
+                  handleDelete(deleteKeyDialog);
+                  setDeleteKeyDialog(null);
+                }
+              }}
+            >
+              Delete
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog
+        open={showNewKeyDialog}
+        onOpenChange={(open) => {
+          setShowNewKeyDialog(open);
+          if (!open) setNewKey(null);
+        }}
+      >
+        <DialogContent className="sm:max-w-2xl">
+          <DialogHeader>
+            <DialogTitle>
+              {newKey ? "API Key Created" : "Create New API Key"}
+            </DialogTitle>
+            {!newKey && (
+              <DialogDescription>
+                Enter a name to identify this API key
+              </DialogDescription>
+            )}
+          </DialogHeader>
+
+          {newKey ? (
+            <div className="space-y-4">
+              <div>
+                <Label>Your new API key:</Label>
+                <div className="flex items-center gap-2 mt-2">
+                  <code className="bg-cbga dark:bg-dbga p-2 rounded flex-grow overflow-hidden text-ellipsis">
+                    {newKey.key}
+                  </code>
+                  <Button
+                    onClick={() => {
+                      navigator.clipboard.writeText(newKey.key);
+                      toast({
+                        title: "Success",
+                        description: "API key copied to clipboard",
+                      });
+                    }}
+                    variant="primary"
+                  >
+                    Copy
+                  </Button>
+                </div>
+              </div>
+
+              <p className="text-sm text-cerr dark:text-derr">
+                Make sure to copy this key now. You won't be able to see it again!
+              </p>
+
+              <DialogFooter>
+                <Button
+                  variant="light"
+                  onClick={() => {
+                    setShowNewKeyDialog(false);
+                    setNewKey(null);
+                  }}
+                >
+                  Close
+                </Button>
+              </DialogFooter>
+            </div>
+          ) : (
+            <form
+              className="space-y-4 mt-4"
+              onSubmit={(e) => {
+                e.preventDefault();
+                const formData = new FormData(e.currentTarget);
+                const selectedPerms = availablePermissions.filter(
+                  (p) => formData.get(`perm-${p.value}`) === "on",
+                ).map((p) => p.value);
+                handleCreateKey(
+                  formData.get("name") as string,
+                  selectedPerms,
+                );
+              }}
+            >
+              <div className="space-y-2">
+                <Label htmlFor="name">Name</Label>
+                <Input
+                  id="name"
+                  name="name"
+                  placeholder="Enter key name"
+                  required
+                  autoFocus
+                />
+              </div>
+
+              <div className="space-y-2">
+                <Label>Permissions</Label>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  {availablePermissions.map((perm) => (
+                    <label
+                      key={perm.value}
+                      className="flex items-center gap-2 p-2 rounded border border-cb dark:border-db cursor-pointer hover:bg-cbga dark:hover:bg-dbga"
+                    >
+                      <input
+                        type="checkbox"
+                        name={`perm-${perm.value}`}
+                        defaultChecked={false}
+                        className="rounded border-cb dark:border-db text-blue-600 focus:ring-blue-500"
+                      />
+                      <span className="text-sm flex-grow">{perm.label}</span>
+                      <span className="font-mono text-xs text-ctext2">{perm.value}</span>
+                    </label>
+                  ))}
+                </div>
+              </div>
+
+              <DialogFooter>
+                <DialogClose asChild>
+                  <Button type="button" variant="secondary">Cancel</Button>
+                </DialogClose>
+                <Button type="submit" className="mb-4 sm:mb-0">Create Key</Button>
+              </DialogFooter>
+            </form>
+          )}
+        </DialogContent>
+      </Dialog>
+    </div >
+  );
+}

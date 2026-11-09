@@ -1,0 +1,268 @@
+# SPDX-License-Identifier: MPL-2.0
+
+name: "Security Scanning"
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  schedule:
+    # Run weekly security scan on main (every Sunday at 03:00 UTC)
+    - cron: "0 3 * * 0"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  codeql:
+    name: CodeQL Scan (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: go
+            build-mode: autobuild
+          - language: javascript-typescript
+            build-mode: none
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        if: matrix.language == 'go'
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: "go.mod"
+          cache: true
+
+      - name: Set up Node.js
+        if: matrix.language == 'javascript-typescript'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "lts/*"
+          cache: "npm"
+
+      # main.go uses //go:embed dist, so dist must exist for Go compilation and analysis
+      - name: Create placeholder dist directory
+        if: matrix.language == 'go'
+        run: |
+          mkdir -p dist
+          touch dist/placeholder
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+
+      - name: Autobuild Go
+        if: matrix.language == 'go'
+        uses: github/codeql-action/autobuild@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          category: "/language:${{ matrix.language }}"
+
+  go-vuln-scan:
+    name: Go Vulnerability Check
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: "go.mod"
+          cache: true
+
+      # main.go uses //go:embed dist, so dist must exist for Go package loading
+      - name: Create placeholder dist directory
+        run: |
+          mkdir -p dist
+          touch dist/placeholder
+
+      - name: Run govulncheck
+        run: |
+          set +e
+          go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+          exit_code=$?
+          set -e
+
+          if [ "$exit_code" -eq 0 ]; then
+            exit 0
+          fi
+
+          # Exit code is non-zero (vulnerabilities found).
+          # Only fail the workflow if at least one called vulnerability has a fixed version available.
+          go run golang.org/x/vuln/cmd/govulncheck@latest -format json ./... > govulncheck-results.json || true
+          if jq -e -s '
+            ([
+              .[] | select(.osv != null) | .osv as $osv |
+              $osv.affected[]? |
+              {
+                key: "\($osv.id):\(.package.name)",
+                value: [ .ranges[]?.events[]?.fixed // empty ]
+              }
+            ] | from_entries) as $fixes |
+            [
+              .[] | select(.finding != null) |
+              .finding as $f |
+              ($f.trace[0].module // "") as $mod |
+              select(($fixes["\($f.osv):\($mod)"] // []) | length > 0)
+            ] | length == 0
+          ' govulncheck-results.json > /dev/null; then
+            echo "No fix available yet for reported vulnerabilities; skipping failure."
+            exit 0
+          fi
+
+          exit 1
+
+  secret-scan:
+    name: Secret Scan (Gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Gitleaks
+        run: |
+          curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.24.0/gitleaks_8.24.0_linux_x64.tar.gz | sudo tar -xz -C /usr/local/bin gitleaks
+
+      - name: Run Gitleaks
+        env:
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gitleaks detect --verbose --redact
+
+  zizmor:
+    name: GitHub Actions Security (zizmor)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run zizmor
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          pipx run zizmor .
+
+  osv-scan:
+    name: Dependency Scan (OSV-Scanner)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install OSV-Scanner
+        run: |
+          curl -sSfL https://github.com/google/osv-scanner/releases/latest/download/osv-scanner_linux_amd64 -o /usr/local/bin/osv-scanner
+          chmod +x /usr/local/bin/osv-scanner
+
+      - name: Run OSV-Scanner
+        run: |
+          set +e
+          osv-scanner -r .
+          exit_code=$?
+          set -e
+
+          if [ "$exit_code" -eq 0 ]; then
+            exit 0
+          elif [ "$exit_code" -ne 1 ]; then
+            exit "$exit_code"
+          fi
+
+          # Exit code 1 means vulnerabilities were found.
+          # Only fail the workflow if at least one called vulnerability has a fixed version available.
+          osv-scanner --format=json --output-file=osv-results.json -r . || true
+          if jq -e '
+            [
+              .results[]?.packages[]? as $pkg
+              | ($pkg.groups // []
+                 | map(select(((.experimental_analysis // .experimentalAnalysis // {}) | length == 0) or ([(.experimental_analysis // .experimentalAnalysis // {})[]?.called] | any)))
+                 | map(.ids[]?)
+                ) as $called_ids
+              | $pkg.vulnerabilities[]?
+              | select(.id as $id | $called_ids | index($id))
+              | [
+                  .affected[]?
+                  | select(.package.name == $pkg.package.name and .package.ecosystem == $pkg.package.ecosystem)
+                  | .ranges[]?.events[]?.fixed // empty
+                ]
+              | select(length > 0)
+            ] | length == 0
+          ' osv-results.json > /dev/null; then
+            echo "No fix available yet for reported vulnerabilities; skipping failure."
+            exit 0
+          fi
+
+          exit 1
+
+  trivy-docker:
+    name: Docker Image Security (Trivy)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Run Trivy on published release image
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: "taleshape/shaper:latest"
+          format: "sarif"
+          output: "trivy-results.sarif"
+          exit-code: "0"
+          ignore-unfixed: false
+          vuln-type: "os,library"
+          severity: "CRITICAL,HIGH"
+          limit-severities-for-sarif: true
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: "trivy-results.sarif"
+          category: "trivy-docker"

@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: MPL-2.0
+
+/bin
+/dist
+npm-package/packages/*/bin
+pip-package/shaper_pkg/bin/*
+!pip-package/shaper_pkg/bin/.gitkeep
+pip-package/build
+pip-package/dist
+pip-package/*.egg-info
+node_modules
+.vite-stats
+.tanstack
+pip-package/shaper_pkg/__pycache__
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.antigravitycli
+
+# Never accidentally leak any secrets
+.env
+
+.security-review/

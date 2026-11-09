@@ -1,0 +1,968 @@
+// SPDX-License-Identifier: MPL-2.0
+
+import { ErrorBoundary } from "react-error-boundary";
+import { Result } from "../../lib/types";
+import { queryTypeToCardCssClass, toCssId, scopeDashboardCSS } from "../../lib/render";
+import { ChartHoverProvider } from "../providers/ChartHoverProvider";
+import { cx, getSearchParamString, VarsParamSchema, getRenderMode, copyToClipboard } from "../../lib/utils";
+import { fetchWithRetry } from "../../lib/fetchWithRetry";
+import DashboardDropdown from "./DashboardDropdown";
+import DashboardDropdownMulti from "./DashboardDropdownMulti";
+import DashboardButton from "./DashboardButton";
+import DashboardDatePicker from "./DashboardDatePicker";
+import DashboardDateRangePicker from "./DashboardDateRangePicker";
+import DashboardInput from "./DashboardInput";
+import { Card } from "../tremor/Card";
+import { translate } from "../../lib/translate";
+import DashboardLineChart from "./DashboardLineChart";
+import DashboardScatterplot from "./DashboardScatterplot";
+import DashboardBarChart from "./DashboardBarChart";
+import DashboardBoxplot from "./DashboardBoxplot";
+import DashboardValue from "./DashboardValue";
+import DashboardTable from "./DashboardTable";
+import { useEffect, useLayoutEffect, useState, useRef, useCallback, useMemo, useId } from "react";
+import { RiCheckLine, RiFileCopyLine, RiLayoutFill, RiLoader3Fill } from "@remixicon/react";
+import DashboardGauge from "./DashboardGauge";
+import DashboardPieChart from "./DashboardPieChart";
+import { ChartDownloadButton } from "../charts/ChartDownloadButton";
+import { TableDownloadButton } from "../charts/TableDownloadButton";
+import { FullscreenButton } from "./FullscreenButton";
+import TextWithLinks from "../TextWithLinks";
+import { isSafeUrl, isRelativeOrQueryUrl } from "../../lib/linkUtils";
+import DashboardTooltip from "./DashboardTooltip";
+
+function measureTextWidth (text: string, font: string): number {
+  if (typeof document === "undefined") return text.length * 9;
+  const canvas = document.createElement("canvas");
+  const context = canvas.getContext("2d");
+  if (!context) return text.length * 9;
+  context.font = font;
+  return context.measureText(text).width;
+}
+
+export interface DashboardProps {
+  id?: string;
+  vars: VarsParamSchema;
+  getJwt: () => Promise<string>;
+  baseUrl?: string;
+  onVarsChanged: (newVars: VarsParamSchema) => void;
+  hash?: string;
+  menuButton?: React.ReactNode;
+  onError?: (error: Error) => void;
+  onDataChange?: (data: Result) => void;
+  loading?: boolean;
+}
+
+const MIN_SHOW_LOADING = 300;
+
+interface ErrorDisplayProps {
+  error: any;
+  resetErrorBoundary?: () => void;
+  errResetRef?: React.MutableRefObject<(() => void) | undefined>;
+  menuButton?: React.ReactNode;
+}
+
+const ErrorDisplay = function ({
+  error,
+  resetErrorBoundary,
+  errResetRef,
+  menuButton,
+}: ErrorDisplayProps) {
+  useEffect(() => {
+    if (errResetRef) {
+      errResetRef.current = resetErrorBoundary;
+    }
+  }, [errResetRef, resetErrorBoundary]);
+
+  const [copied, setCopied] = useState(false);
+
+  const handleCopy = async () => {
+    const success = await copyToClipboard(error.message);
+    if (success) {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    }
+  };
+
+  return (
+    <div className="antialiased text-ctext dark:text-dtext">
+      {menuButton}
+      <div>
+        <div className="p-4 z-50 flex justify-center items-center">
+          <div id="shaper-error-message" className="p-4 bg-red-100 text-red-700 h-fit rounded flex items-start gap-4">
+            <span>{error.message}</span>
+            <button
+              onClick={handleCopy}
+              className="shrink-0 text-red-500 hover:text-red-700 transition-colors"
+              title="Copy error message"
+            >
+              {copied ? (
+                <RiCheckLine className="size-5" />
+              ) : (
+                <RiFileCopyLine className="size-5" />
+              )}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export function Dashboard ({
+  id,
+  vars,
+  getJwt,
+  baseUrl = window.shaper.defaultBaseUrl,
+  onVarsChanged,
+  // We update this string when JWT variables change to trigger a re-fetch
+  hash = "",
+  menuButton,
+  onError,
+  onDataChange,
+  loading,
+}: DashboardProps) {
+  const [fetchedData, setFetchedData] = useState<Result | undefined>(undefined);
+  const [error, setError] = useState<Error | null>(null);
+  const [isFetching, setIsFetching] = useState<boolean>(false);
+  const errResetRef = useRef<(() => void) | undefined>(undefined);
+
+  // Add timeout ref to store the timeout ID
+  const reloadTimeoutRef = useRef<NodeJS.Timeout>();
+  // Track the current AbortController so we can cancel in-flight requests
+  const fetchAbortRef = useRef<AbortController | null>(null);
+  const fetchDataRef = useRef<() => Promise<void>>();
+
+  // Function to fetch dashboard data
+  const fetchData = useCallback(async () => {
+    if (!id) return;
+
+    // Abort any in-flight request before starting a new one
+    if (fetchAbortRef.current) {
+      fetchAbortRef.current.abort();
+    }
+    const abortController = new AbortController();
+    fetchAbortRef.current = abortController;
+
+    // Clear previous reload timer when starting a new fetch
+    if (reloadTimeoutRef.current) {
+      clearTimeout(reloadTimeoutRef.current);
+      reloadTimeoutRef.current = undefined;
+    }
+
+    setError(null);
+    setIsFetching(true);
+    const startTime = Date.now();
+
+    try {
+      const d = await fetchDashboard(id, vars, baseUrl, getJwt, abortController.signal);
+      const duration = Date.now() - startTime;
+      await new Promise<void>(resolve => {
+        setTimeout(() => {
+          resolve();
+        }, Math.max(0, MIN_SHOW_LOADING - duration));
+      });
+
+      // Only apply the results if this request is still the latest
+      if (fetchAbortRef.current === abortController) {
+        setFetchedData(d);
+        if (onDataChange) {
+          onDataChange(d);
+        }
+        // Set up reload timeout if reloadAt is in the future
+        if (d.reloadAt > Date.now()) {
+          const timeout = Math.max(1000, d.reloadAt - Date.now());
+          reloadTimeoutRef.current = setTimeout(() => {
+            fetchDataRef.current?.();
+          }, timeout);
+        }
+      }
+    } catch (err: unknown) {
+      // Swallow abort errors (they are expected when a new request starts)
+      if ((err as any)?.name === "AbortError") {
+        return;
+      }
+      setError(err as Error);
+      onError?.(err as Error);
+    } finally {
+      // Only clear fetching state if this is still the latest request
+      if (fetchAbortRef.current === abortController) {
+        setIsFetching(false);
+      }
+    }
+  }, [id, vars, baseUrl, getJwt, onDataChange, onError]);
+
+  useEffect(() => {
+    fetchDataRef.current = fetchData;
+  }, [fetchData]);
+
+  // Initial fetch and cleanup
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    fetchData();
+    return () => {
+      // Clear timeouts on cleanup
+      if (reloadTimeoutRef.current) {
+        clearTimeout(reloadTimeoutRef.current);
+      }
+      // Abort any in-flight request on unmount
+      if (fetchAbortRef.current) {
+        fetchAbortRef.current.abort();
+      }
+    };
+  }, [fetchData, hash]);
+
+  useEffect(() => {
+    if (errResetRef.current) {
+      errResetRef.current();
+      errResetRef.current = undefined;
+    }
+  }, [loading]);
+
+  if (error) {
+    return (
+      <ErrorDisplay
+        error={error}
+        errResetRef={errResetRef}
+        menuButton={menuButton}
+      />
+    );
+  }
+
+  return fetchedData ? (
+    <ErrorBoundary
+      fallbackRender={(props) => (
+        <ErrorDisplay
+          {...props}
+          errResetRef={errResetRef}
+          menuButton={menuButton}
+        />
+      )}
+    >
+      <DataView
+        data={fetchedData}
+        onVarsChanged={onVarsChanged}
+        menuButton={menuButton}
+        vars={vars}
+        baseUrl={baseUrl}
+        getJwt={getJwt}
+        loading={loading || isFetching}
+      />
+    </ErrorBoundary>
+  ) : (
+    <ChartHoverProvider>
+      <div className="w-full flex justify-center items-center flex-grow">
+        <RiLoader3Fill className="size-7 fill-ctext dark:fill-dtext animate-spin" />
+      </div>
+    </ChartHoverProvider>
+  );
+}
+
+const getScrollParent = (node: HTMLElement | null): HTMLElement | null => {
+  let parent = node?.parentElement;
+  while (parent && parent !== document.body && parent !== document.documentElement) {
+    const { overflowY } = window.getComputedStyle(parent);
+    if (overflowY === "auto" || overflowY === "scroll") {
+      return parent;
+    }
+    parent = parent.parentElement;
+  }
+  return null;
+};
+
+const DataView = ({
+  data,
+  onVarsChanged,
+  menuButton,
+  vars,
+  baseUrl,
+  getJwt,
+  loading,
+}: (Pick<DashboardProps, "onVarsChanged" | "menuButton" | "vars" | "baseUrl" | "getJwt">) & { data: Result; loading: boolean }) => {
+  const [fullscreenId, setFullscreenId] = useState<string | null>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const savedScrollRef = useRef<{
+    container: HTMLElement | null;
+    scrollTop: number;
+    scrollLeft: number;
+    windowScrollY: number;
+    windowScrollX: number;
+  } | null>(null);
+
+  const handleToggleFullscreen = useCallback((id: string | null) => {
+    if (id && !fullscreenId) {
+      const container = getScrollParent(containerRef.current);
+      savedScrollRef.current = {
+        container,
+        scrollTop: container ? container.scrollTop : 0,
+        scrollLeft: container ? container.scrollLeft : 0,
+        windowScrollY: window.scrollY || document.documentElement.scrollTop || document.body.scrollTop || 0,
+        windowScrollX: window.scrollX || document.documentElement.scrollLeft || document.body.scrollLeft || 0,
+      };
+      setFullscreenId(id);
+    } else {
+      setFullscreenId(null);
+    }
+  }, [fullscreenId]);
+
+  useLayoutEffect(() => {
+    if (!fullscreenId && savedScrollRef.current) {
+      const { container, scrollTop, scrollLeft, windowScrollY, windowScrollX } = savedScrollRef.current;
+      savedScrollRef.current = null;
+
+      const restore = () => {
+        if (container && (!("isConnected" in container) || container.isConnected)) {
+          container.scrollTop = scrollTop;
+          container.scrollLeft = scrollLeft;
+        }
+        if (windowScrollY > 0 || windowScrollX > 0) {
+          window.scrollTo(windowScrollX, windowScrollY);
+          if (document.documentElement) {
+            document.documentElement.scrollTop = windowScrollY;
+            document.documentElement.scrollLeft = windowScrollX;
+          }
+          if (document.body) {
+            document.body.scrollTop = windowScrollY;
+            document.body.scrollLeft = windowScrollX;
+          }
+        }
+      };
+
+      restore();
+      const rafId = requestAnimationFrame(restore);
+      return () => cancelAnimationFrame(rafId);
+    }
+  }, [fullscreenId]);
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && fullscreenId) {
+        handleToggleFullscreen(null);
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [fullscreenId, handleToggleFullscreen]);
+
+  const sections: Result["sections"] = data.sections.length > 0 && data.sections[0].type === "header"
+    ? data.sections
+    : [
+      {
+        type: "header",
+        queries: [],
+      },
+      ...data.sections,
+    ];
+
+  const numContentSections = sections.filter(
+    (section) => section.type === "content",
+  ).length;
+
+  const totalContentQueries = sections.reduce(
+    (acc, section) => section.type === "content"
+      ? acc + section.queries.filter(q => q.render.type !== "placeholder").length
+      : acc,
+    0,
+  );
+
+  type HeaderSection = Extract<Result["sections"][number], { type: "header" }>;
+  const groupedSections: {
+    sections: { section: Result["sections"][number]; index: number }[];
+  }[] = [];
+
+  sections.forEach((section, index) => {
+    const lastGroup = groupedSections[groupedSections.length - 1];
+    const lastGroupHasSubstantialContent = lastGroup?.sections.some(
+      (s) => s.section.type === "content" && s.section.queries.length > 0,
+    );
+
+    if (section.type === "header") {
+      if (!lastGroup || lastGroupHasSubstantialContent) {
+        groupedSections.push({
+          sections: [{ section, index }],
+        });
+      } else {
+        lastGroup.sections.push({ section, index });
+      }
+    } else {
+      if (lastGroup) {
+        lastGroup.sections.push({ section, index });
+      } else {
+        groupedSections.push({
+          sections: [{ section, index }],
+        });
+      }
+    }
+  });
+
+  const instanceId = useId().replace(/[^a-zA-Z0-9_-]/g, "");
+  const scopeClass = `shaper-instance-${instanceId}`;
+
+  // Security & Code Injection Rationale:
+  // 1. Trust Model: Dashboard SQL queries are authored by authorized dashboard creators/admins
+  //    (the same trusted persona defining queries, custom labels, and schema).
+  // 2. JavaScript Execution Impossibility in Modern CSS: In modern standards-compliant browsers,
+  //    CSS style sheets cannot execute JavaScript (legacy vectors like expression() or -moz-binding
+  //    are deprecated and absent).
+  // 3. HTML Parser Breakout Mitigation: The sole viable XSS vector from an inline <style> block is
+  //    prematurely closing the tag (e.g., `</style><script>...`). Both backend and frontend sanitize
+  //    closing style tags (`</style` -> `<\/style`), preventing DOM tag breakout.
+  // 4. Scope Isolation: `scopeDashboardCSS` encapsulates rules inside a unique `.shaper-instance-*`
+  //    container via `@scope` (with CSS nesting fallback) and remaps `body`/`html`/`:root` to `:scope`,
+  //    preventing style hijacking or layout distortion in embedding host applications.
+  const safeCSS = useMemo(() => {
+    if (!data.css) return null;
+    const sanitized = data.css.replace(/<\s*\/\s*style/gi, "<\\/style");
+    return scopeDashboardCSS(sanitized, scopeClass);
+  }, [data.css, scopeClass]);
+
+  return (<ChartHoverProvider>
+    <div ref={containerRef} className={cx("relative w-full h-full shaper-scope min-h-0", scopeClass, { "overflow-hidden max-h-screen": !!fullscreenId })}>
+      {safeCSS && (
+        <style dangerouslySetInnerHTML={{ __html: safeCSS }} />
+      )}
+      <div className={cx("shaper-custom-dashboard-header", { "mx-4 mt-6 mb-6": !!data.headerImage })} data-header-image={data.headerImage}>
+        {data.headerImage && (
+          <img
+            src={data.headerImage}
+            alt="Header Image"
+            className="max-h-16 object-contain"
+          />
+        )}
+      </div>
+      {groupedSections.map((group, groupIndex) => {
+        const sectionClasses = group.sections
+          .map(({ section }) => section.class)
+          .filter(Boolean)
+          .join(" ");
+        return (
+          <section key={groupIndex} className={cx("shaper-section break-inside-avoid", sectionClasses)}>
+            {group.sections.map(({ section, index: sectionIndex }) => {
+              if (section.type === "header") {
+                const header = section as HeaderSection;
+                const queries = header.queries.filter(
+                  (query) => query.rows.length > 0,
+                );
+                return (
+                  <div
+                    key={sectionIndex}
+                    id={toCssId(`header${sectionIndex}`)}
+                    className={cx("shaper-section-header flex flex-wrap items-center ml-2 mr-4", {
+                      "mt-3 mb-3": header.queries.length > 0 || header.title || header.subtitle || header.tooltip,
+                      "mt-8": (header.title || header.subtitle || header.tooltip) && sectionIndex !== 0,
+                      "my-2": header.queries.length === 0 && !header.title && !header.subtitle && !header.tooltip && sectionIndex === 0,
+                      "pb-4": sectionIndex === sections.length - 1,
+                    })}
+                  >
+                    <div
+                      className={cx("@sm:flex-grow flex items-center ml-1", {
+                        "w-full @sm:w-fit": header.title || header.subtitle || header.tooltip,
+                      })}
+                    >
+                      {sectionIndex === 0 ? (
+                        <>
+                          {menuButton}
+                          {header.title || header.subtitle || header.tooltip ? (
+                            <div className="flex flex-col ml-1">
+                              {header.title ? (
+                                <div className="flex items-center gap-2">
+                                  <h1 className="shaper-section-title text-2xl text-left py-1 mt-0.5 font-semibold">
+                                    {header.title}
+                                  </h1>
+                                  {header.tooltip ? (
+                                    <DashboardTooltip content={header.tooltip} size="md" />
+                                  ) : null}
+                                </div>
+                              ) : header.tooltip ? (
+                                <div className="py-1">
+                                  <DashboardTooltip content={header.tooltip} size="md" />
+                                </div>
+                              ) : null}
+                              {header.subtitle ? (
+                                <p className="shaper-section-subtitle text-sm text-ctext2 dark:text-dtext2 text-left -mt-0.5 mb-1">
+                                  <TextWithLinks text={header.subtitle} />
+                                </p>
+                              ) : null}
+                            </div>
+                          ) : null}
+                        </>
+                      ) : header.title || header.subtitle || header.tooltip ? (
+                        <div className="flex flex-col ml-1">
+                          {header.title ? (
+                            <div className="flex items-center gap-2">
+                              <h2 className="text-xl text-left mt-0.5 font-semibold">
+                                {header.title}
+                              </h2>
+                              {header.tooltip ? (
+                                <DashboardTooltip content={header.tooltip} size="md" />
+                              ) : null}
+                            </div>
+                          ) : header.tooltip ? (
+                            <div className="py-1">
+                              <DashboardTooltip content={header.tooltip} size="md" />
+                            </div>
+                          ) : null}
+                          {header.subtitle ? (
+                            <p className="text-sm text-ctext2 dark:text-dtext2 text-left mt-0.5 mb-1">
+                              <TextWithLinks text={header.subtitle} />
+                            </p>
+                          ) : null}
+                        </div>
+                      ) : null}
+                    </div>
+                    {queries.map(({ render, columns, rows }, index) => {
+                      if (render.type === "dropdown") {
+                        return (
+                          <DashboardDropdown
+                            key={index}
+                            idPrefix={`header${sectionIndex}-${render.type}-`}
+                            label={render.label}
+                            className={render.class}
+                            headers={columns}
+                            data={rows as (string | number | boolean)[][]}
+                            vars={vars}
+                            onChange={onVarsChanged}
+                          />
+                        );
+                      }
+                      if (render.type === "dropdownMulti") {
+                        return (
+                          <DashboardDropdownMulti
+                            key={index}
+                            idPrefix={`header${sectionIndex}-${render.type}-`}
+                            label={render.label}
+                            className={render.class}
+                            headers={columns}
+                            data={rows as (string | number | boolean)[][]}
+                            vars={vars}
+                            onChange={onVarsChanged}
+                          />
+                        );
+                      }
+                      if (render.type === "button") {
+                        return (
+                          <DashboardButton
+                            key={index}
+                            idPrefix={`header${sectionIndex}-${render.type}-`}
+                            label={render.label}
+                            className={render.class}
+                            headers={columns}
+                            data={rows as (string | number | boolean)[][]}
+                            baseUrl={baseUrl}
+                            getJwt={getJwt}
+                          />
+                        );
+                      }
+                      if (render.type === "datepicker") {
+                        return (
+                          <DashboardDatePicker
+                            key={index}
+                            idPrefix={`header${sectionIndex}-${render.type}-`}
+                            label={render.label}
+                            className={render.class}
+                            headers={columns}
+                            data={rows as (string | number | boolean)[][]}
+                            vars={vars}
+                            onChange={onVarsChanged}
+                          />
+                        );
+                      }
+                      if (render.type === "daterangePicker") {
+                        return (
+                          <DashboardDateRangePicker
+                            key={index}
+                            idPrefix={`header${sectionIndex}-${render.type}-`}
+                            label={render.label}
+                            className={render.class}
+                            headers={columns}
+                            data={rows as (string | number | boolean)[][]}
+                            vars={vars}
+                            onChange={onVarsChanged}
+                          />
+                        );
+                      }
+                      if (render.type === "input") {
+                        return (
+                          <DashboardInput
+                            key={index}
+                            idPrefix={`header${sectionIndex}-${render.type}-`}
+                            label={render.label}
+                            className={render.class}
+                            headers={columns}
+                            data={rows as (string | number | boolean)[][]}
+                            vars={vars}
+                            onChange={onVarsChanged}
+                          />
+                        );
+                      }
+                    })}
+                  </div>
+                );
+              }
+
+              const numQueriesInSection = section.queries.length;
+
+              return (
+                <div
+                  key={sectionIndex}
+                  id={toCssId(`content${sectionIndex}`)}
+                  className={cx("shaper-section-content grid grid-cols-1 ml-4", {
+                    "@sm:grid-cols-2 print:grid-cols-2": numQueriesInSection > 1,
+                    "@sm:grid-cols-3 print:grid-cols-3":
+                      numQueriesInSection === 3 && section.queries.every(q => q.render.type === "value"),
+                    "@lg:grid-cols-2 print:grid-cols-2":
+                      numQueriesInSection === 2 ||
+                      (numContentSections === 1 && numQueriesInSection === 4),
+                    "@lg:grid-cols-3":
+                      numQueriesInSection > 4 ||
+                      numQueriesInSection === 3 ||
+                      (numQueriesInSection === 4 && numContentSections > 1),
+                    "@xl:grid-cols-4":
+                      (numQueriesInSection === 4 && numContentSections > 1) ||
+                      numQueriesInSection === 7 ||
+                      numQueriesInSection === 8 ||
+                      numQueriesInSection > 9,
+                    "@4xl:grid-cols-5":
+                      (numQueriesInSection === 5 && numContentSections > 1) ||
+                      numQueriesInSection >= 9,
+                  })}
+                >
+                  {section.queries.map((query, queryIndex) => {
+                    if (query.render.type === "placeholder") {
+                      return <div key={queryIndex} className={cx("shaper-placeholder", query.render.class)}></div>;
+                    }
+                    const currentId = `${sectionIndex}-${queryIndex}`;
+                    const isFullscreen = fullscreenId === currentId;
+                    const isBigChartQuery = query.render.type === "linechart" || query.render.type === "scatterplot" || query.render.type.startsWith("barchart") || query.render.type.startsWith("boxplot");
+                    const isChartQuery = isBigChartQuery || query.render.type === "gauge" || query.render.type === "piechart" || query.render.type === "donutchart";
+                    const singleTable = numQueriesInSection === 1 && query.render.type === "table";
+                    const sectionHasBigChart = section.queries.some(q => q.render.type !== "table" && q.render.type !== "value" && q.render.type !== "gauge" && q.render.type !== "piechart" && q.render.type !== "donutchart");
+                    const sectionHasChart = section.queries.some(q => q.render.type !== "table" && q.render.type !== "value");
+                    const cardCssId = query.render.label || `${query.render.type}${queryIndex}`;
+                    const isPdf = getRenderMode() === "pdf";
+                    const cardLink = !isFullscreen && query.render.link && isSafeUrl(query.render.link) && (!isPdf || !isRelativeOrQueryUrl(query.render.link)) ? query.render.link : undefined;
+                    return (
+                      <Card
+                        key={queryIndex}
+                        as={cardLink ? "a" : "div"}
+                        href={cardLink}
+                        target={cardLink && query.render.linkNewTab ? "_blank" : undefined}
+                        rel={cardLink && query.render.linkNewTab ? "noopener noreferrer" : undefined}
+                        id={toCssId(`content${sectionIndex}-${cardCssId}`)}
+                        className={cx(
+                          "shaper-card",
+                          cardLink && "cursor-pointer [&_*]:cursor-pointer no-underline text-inherit transition-all duration-150 hover:border-cprimary dark:hover:border-dprimary hover:shadow-sm",
+                          queryTypeToCardCssClass(query.render.type),
+                          query.render.class,
+                          "mr-4 mb-4 bg-cbg dark:bg-dbg border border-cbga rounded flex flex-col",
+                          isFullscreen ? "absolute inset-0 z-[100] m-0 h-full w-full overflow-auto p-8 border-none" : {
+                            "border-none": numQueriesInSection === 1 && !query.render.label && !query.render.subtitle && !query.render.tooltip,
+                            "break-inside-avoid": !singleTable,
+                            "min-h-[240px]": isChartQuery,
+                            "@sm:min-h-[240px]": numQueriesInSection > 1 && (sectionHasBigChart || section.queries.some(q => q.render.type === "table")),
+                            "h-[360px]": getRenderMode() !== "pdf" && isBigChartQuery || (numQueriesInSection > 1 && query.render.type === "table"),
+                            "h-[240px]": isChartQuery && !isBigChartQuery,
+                            "@sm:h-[360px]": getRenderMode() !== "pdf" && numQueriesInSection > 1 && sectionHasBigChart,
+                            // single table
+                            "max-h-[calc(100cqh-5.2rem)] print:max-h-none": getRenderMode() !== "pdf" && singleTable,
+                            // pdf
+                            "h-[340px]": getRenderMode() === "pdf" && sectionHasBigChart && (numContentSections > 1 || numQueriesInSection > 1),
+                            // single chart in pdf should should be higher. This is also what we use for PNG API downloads.
+                            "h-[400px]": getRenderMode() === "pdf" && isChartQuery && numContentSections === 1 && numQueriesInSection === 1,
+                            // fill screen height if only 2 sections
+                            "@sm:h-[calc(50cqh-3.1rem)]": getRenderMode() !== "pdf" && sectionHasBigChart && numContentSections === 2,
+                            // single chart and not table
+                            "@sm:h-[calc(70cqh-5.2rem)] @md:h-[calc(85cqh-5.2rem)] @lg:h-[calc(100cqh-5.2rem)]": getRenderMode() !== "pdf" && section.queries.some(q => q.render.type !== "table") && numContentSections === 1 && numQueriesInSection <= 2,
+                            // max heights:
+                            // 1 or 2 cols
+                            "max-h-[calc(82cqw)] @sm:max-h-[calc(37cqw)] @lg:max-h-[calc(33cqw)]": sectionHasChart && (numContentSections > 1 || numQueriesInSection > 1),
+                            // 3 cols
+                            "@lg:max-h-[calc(24cqw)]": sectionHasChart && (
+                              numQueriesInSection > 4 ||
+                              numQueriesInSection === 3 ||
+                              (numQueriesInSection === 4 && numContentSections > 1)),
+                            // 4 cols
+                            "@xl:max-h-[calc(16cqw)]": sectionHasChart && (
+                              (numQueriesInSection === 4 && numContentSections > 1) ||
+                              numQueriesInSection === 7 ||
+                              numQueriesInSection === 8 ||
+                              numQueriesInSection > 9),
+                            // 5 cols
+                            "@4xl:max-h-[calc(13cqw)]": sectionHasChart && (numQueriesInSection === 5 && numContentSections > 1) ||
+                              numQueriesInSection >= 9,
+                            // not height related:
+                            "break-before-avoid": singleTable,
+                            "p-4": !isChartQuery,
+                          },
+                        )}
+                      >
+                        {(isChartQuery || query.render.type === "table") && totalContentQueries > 1 && (
+                          <FullscreenButton
+                            isFullscreen={isFullscreen}
+                            onToggle={() => handleToggleFullscreen(isFullscreen ? null : currentId)}
+                            className={cx("right-2", isFullscreen && "top-8 right-8")}
+                          />
+                        )}
+                        {isChartQuery ? (
+                          <>
+                            {query.render.tooltip && (
+                              <div
+                                className="absolute z-40"
+                                style={
+                                  query.render.label
+                                    ? {
+                                      top: isFullscreen ? "47px" : "15px",
+                                      left: `${(isFullscreen ? 48 : 16) + Math.round(measureTextWidth(query.render.label, "600 15px Geist, system-ui, -apple-system, sans-serif")) + 6}px`,
+                                    }
+                                    : {
+                                      top: isFullscreen ? "36px" : "13px",
+                                      right: isFullscreen
+                                        ? "104px"
+                                        : totalContentQueries > 1
+                                          ? "74px"
+                                          : "42px",
+                                    }
+                                }
+                              >
+                                <DashboardTooltip content={query.render.tooltip} size="sm" />
+                              </div>
+                            )}
+                            <ChartDownloadButton
+                              chartId={`${sectionIndex}-${queryIndex}`}
+                              label={query.render.label}
+                              className={cx("absolute top-2 right-2 z-40", { "top-8 right-16": isFullscreen, "right-10": totalContentQueries > 1 && !isFullscreen })}
+                              id={toCssId(`content${sectionIndex}-${cardCssId}-download-button`)}
+                            />
+                          </>
+                        ) : (
+                          <>
+                            {query.render.label ? (
+                              <div className={cx("flex items-center gap-1.5", { "pb-2": !query.render.subtitle, "pb-0.5": !!query.render.subtitle })}>
+                                <h2 className="text-[15px] font-semibold font-display">
+                                  {query.render.label}
+                                </h2>
+                                {query.render.tooltip ? (
+                                  <DashboardTooltip
+                                    content={query.render.tooltip}
+                                    size="sm"
+                                  />
+                                ) : null}
+                              </div>
+                            ) : query.render.tooltip ? (
+                              <div
+                                className={cx(
+                                  "flex items-center pb-2",
+                                  query.render.subtitle ? "justify-between gap-2" : "justify-end",
+                                  query.render.type === "table" && "pr-16",
+                                )}
+                              >
+                                {query.render.subtitle ? (
+                                  <p className="text-sm text-ctext2 dark:text-dtext2">
+                                    <TextWithLinks text={query.render.subtitle} />
+                                  </p>
+                                ) : null}
+                                <DashboardTooltip content={query.render.tooltip} size="sm" />
+                              </div>
+                            ) : null}
+                            {query.render.subtitle && (query.render.label || !query.render.tooltip) && (
+                              <p className="text-sm text-ctext2 dark:text-dtext2 pb-2">
+                                <TextWithLinks text={query.render.subtitle} />
+                              </p>
+                            )}
+                            {query.render.type === "table" && (
+                              <TableDownloadButton
+                                headers={query.columns}
+                                data={query.rows as (string | number | boolean)[][]}
+                                label={query.render.label}
+                                className={cx("right-10", isFullscreen && "top-8 right-16")}
+                                id={toCssId(`content${sectionIndex}-${cardCssId}-download-button`)}
+                              />
+                            )}
+                          </>
+                        )}
+                        {
+                          renderContent(
+                            query,
+                            sectionIndex,
+                            queryIndex,
+                            data.minTimeValue,
+                            data.maxTimeValue,
+                          )
+                        }
+                      </Card>
+                    );
+                  })}
+                </div>
+              );
+            })}
+          </section>
+        );
+      })}
+      {
+        numContentSections === 0 ? (
+          <div className="mt-32 flex flex-col items-center justify-center text-ctext2 dark:text-dtext2">
+            <RiLayoutFill
+              className="mx-auto size-9"
+              aria-hidden={true}
+            />
+            <p className="mt-3 font-medium">
+              {translate("Nothing to show yet")}
+            </p>
+          </div>
+        ) : null
+      }
+      <div
+        className={cx("shaper-custom-dashboard-footer", {
+          "grow mx-4 mt-14 pb-4 flex items-end": !!data.footerLink,
+        })}
+        data-footer-link={data.footerLink}
+      >
+        {data.footerLink && /^(https?:|mailto:)/i.test(data.footerLink) && (
+          <a
+            href={data.footerLink}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="no-underline text-ctext2 dark:text-dtext2 text-xs"
+          >{data.footerLinkText || data.footerLink.replace(/^(https?:\/\/)|(mailto:)/, "")}</a>
+        )}
+      </div>
+      {loading && (
+        <div className="sticky bottom-0 h-0 z-50 pointer-events-none w-full relative">
+          <div className="p-1 bg-cbgs dark:bg-dbgs rounded-md shadow-md absolute right-2 bottom-2">
+            <RiLoader3Fill className="size-7 fill-ctext dark:fill-dtext animate-spin" />
+          </div>
+        </div>
+      )}
+    </div>
+  </ChartHoverProvider >);
+};
+
+const renderContent = (
+  query: Result["sections"][0]["queries"][0],
+  sectionIndex: number,
+  queryIndex: number,
+  minTimeValue: number,
+  maxTimeValue: number,
+) => {
+  if (query.render.type === "linechart") {
+    return (
+      <DashboardLineChart
+        chartId={`${sectionIndex}-${queryIndex}`}
+        label={query.render.label}
+        subtitle={query.render.subtitle}
+        headers={query.columns}
+        data={query.rows as (string | number | boolean)[][]}
+        minTimeValue={minTimeValue}
+        maxTimeValue={maxTimeValue}
+        markLines={query.render.markLines}
+      />
+    );
+  }
+  if (query.render.type === "scatterplot") {
+    return (
+      <DashboardScatterplot
+        chartId={`${sectionIndex}-${queryIndex}`}
+        label={query.render.label}
+        subtitle={query.render.subtitle}
+        headers={query.columns}
+        data={query.rows as (string | number | boolean)[][]}
+        minTimeValue={minTimeValue}
+        maxTimeValue={maxTimeValue}
+        markLines={query.render.markLines}
+      />
+    );
+  }
+  if (query.render.type === "gauge") {
+    return (
+      <DashboardGauge
+        chartId={`${sectionIndex}-${queryIndex}`}
+        headers={query.columns}
+        data={query.rows}
+        gaugeCategories={query.render.gaugeCategories}
+        label={query.render.label}
+        subtitle={query.render.subtitle}
+      />
+    );
+  }
+  if (
+    query.render.type === "barchartHorizontal" ||
+    query.render.type === "barchartHorizontalStacked" ||
+    query.render.type === "barchartVertical" ||
+    query.render.type === "barchartVerticalStacked"
+  ) {
+    return (
+      <DashboardBarChart
+        chartId={`${sectionIndex}-${queryIndex}`}
+        label={query.render.label}
+        subtitle={query.render.subtitle}
+        stacked={
+          query.render.type === "barchartHorizontalStacked" ||
+          query.render.type === "barchartVerticalStacked"
+        }
+        vertical={
+          query.render.type === "barchartVertical" ||
+          query.render.type === "barchartVerticalStacked"
+        }
+        headers={query.columns}
+        data={query.rows as (string | number | boolean)[][]}
+        minTimeValue={minTimeValue}
+        maxTimeValue={maxTimeValue}
+        markLines={query.render.markLines}
+      />
+    );
+  }
+  if (query.render.type === "piechart" || query.render.type === "donutchart") {
+    return (
+      <DashboardPieChart
+        chartId={`${sectionIndex}-${queryIndex}`}
+        label={query.render.label}
+        subtitle={query.render.subtitle}
+        headers={query.columns}
+        data={query.rows as (string | number | boolean)[][]}
+        isDonut={query.render.type === "donutchart"}
+      />
+    );
+  }
+  if (query.render.type === "boxplot") {
+    return (
+      <DashboardBoxplot
+        chartId={`${sectionIndex}-${queryIndex}`}
+        label={query.render.label}
+        subtitle={query.render.subtitle}
+        headers={query.columns}
+        data={query.rows}
+        markLines={query.render.markLines}
+      />
+    );
+  }
+  if (query.render.type === "value") {
+    return <DashboardValue headers={query.columns} data={query.rows} />;
+  }
+  return <DashboardTable headers={query.columns} data={query.rows} />;
+};
+
+const fetchDashboard = async (
+  id: string,
+  vars: VarsParamSchema,
+  baseUrl: string,
+  getJwt: () => Promise<string>,
+  signal?: AbortSignal,
+): Promise<Result> => {
+  const jwt = await getJwt();
+  const searchParams = getSearchParamString(vars);
+  const isTemporary = id.startsWith("shaper-tmp.");
+  const res = await fetchWithRetry(`${baseUrl}api/dashboards/${id}?${searchParams}`, {
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: jwt,
+    },
+    signal,
+  }, isTemporary ? { maxRetries: 0 } : undefined);
+  const json = await res.json();
+  if (res.status !== 200) {
+    throw new Error(
+      (json?.error ?? json?.Error?.Msg ?? json?.Error ?? json?.message ?? json).toString(),
+    );
+  }
+  return json;
+};

@@ -1,0 +1,166 @@
+// SPDX-License-Identifier: MPL-2.0
+
+package core
+
+import (
+	"encoding/json"
+	"fmt"
+
+	"github.com/jmoiron/sqlx"
+)
+
+// TODO: The DB init costs us ~12ms on startup. Does it make sense to not do this every time?
+func InitSQLite(sdb *sqlx.DB) error {
+	// Settings
+	_, err := sdb.Exec(`
+		PRAGMA journal_mode = WAL;
+		PRAGMA synchronous = NORMAL;
+		PRAGMA auto_vacuum = INCREMENTAL;
+		PRAGMA foreign_keys = on;
+		PRAGMA busy_timeout = 5000;
+	`)
+	if err != nil {
+		return fmt.Errorf("error setting pragmas: %w", err)
+	}
+
+	// Create folders table first (since apps references it)
+	_, err = sdb.Exec(`
+		CREATE TABLE IF NOT EXISTS folders (
+			id TEXT PRIMARY KEY,
+			parent_folder_id TEXT,
+			name TEXT NOT NULL,
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL,
+			created_by TEXT,
+			updated_by TEXT,
+			FOREIGN KEY(parent_folder_id) REFERENCES folders(id) ON DELETE CASCADE
+		)
+	`)
+	if err != nil {
+		return fmt.Errorf("error creating folders table: %w", err)
+	}
+
+	// Create apps table
+	_, err = sdb.Exec(`
+		CREATE TABLE IF NOT EXISTS apps (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			content TEXT NOT NULL,
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL,
+			created_by TEXT,
+			updated_by TEXT,
+			visibility TEXT,
+			type TEXT NOT NULL,
+			password_hash TEXT,
+			folder_id TEXT,
+			FOREIGN KEY(folder_id) REFERENCES folders(id) ON DELETE CASCADE
+		)
+	`)
+	if err != nil {
+		return fmt.Errorf("error creating apps table: %w", err)
+	}
+	// Ignore errors if column already exists
+	_, _ = sdb.Exec(`ALTER TABLE apps ADD COLUMN folder_id TEXT REFERENCES folders(id) ON DELETE CASCADE`)
+	// Ignore errors if column does not exist
+	_, _ = sdb.Exec(`ALTER TABLE apps DROP COLUMN path`)
+
+	// Create api_keys table
+	_, err = sdb.Exec(`
+		CREATE TABLE IF NOT EXISTS api_keys (
+			id TEXT PRIMARY KEY,
+			hash TEXT NOT NULL,
+			salt TEXT NOT NULL,
+			name TEXT NOT NULL,
+			permissions TEXT,
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL,
+			created_by TEXT,
+			updated_by TEXT
+		)
+	`)
+	if err != nil {
+		return fmt.Errorf("error creating config table: %w", err)
+	}
+	// Ignore errors if column already exists
+	_, _ = sdb.Exec(`ALTER TABLE api_keys ADD COLUMN permissions TEXT`)
+
+	// Give all permissions to legacy keys
+	allPerms, _ := json.Marshal(AllPermissions)
+	_, _ = sdb.Exec(`UPDATE api_keys SET permissions = $1 WHERE permissions IS NULL OR permissions = ''`, string(allPerms))
+
+	// Create users table
+	_, err = sdb.Exec(`
+		CREATE TABLE IF NOT EXISTS users (
+			id TEXT PRIMARY KEY,
+			email TEXT NOT NULL,
+			password_hash TEXT,
+			name TEXT NOT NULL,
+			created_at DATETIME NOT NULL,
+			updated_at DATETIME NOT NULL,
+			created_by TEXT,
+			updated_by TEXT,
+			deleted_at DATETIME,
+			deleted_by TEXT
+		)
+	`)
+	if err != nil {
+		return fmt.Errorf("error creating users table: %w", err)
+	}
+	// Create sessions table
+	_, err = sdb.Exec(`
+		CREATE TABLE IF NOT EXISTS sessions (
+			id TEXT PRIMARY KEY,
+			user_id TEXT NOT NULL,
+			hash TEXT NOT NULL,
+			salt TEXT NOT NULL,
+			created_at DATETIME NOT NULL,
+			FOREIGN KEY(user_id) REFERENCES users(id)
+		)
+	`)
+	if err != nil {
+		return fmt.Errorf("error creating sessions table: %w", err)
+	}
+
+	// Create invites table
+	_, err = sdb.Exec(`
+		CREATE TABLE IF NOT EXISTS invites (
+			code TEXT PRIMARY KEY,
+			email TEXT NOT NULL,
+			created_at DATETIME NOT NULL,
+			created_by TEXT
+		)
+	`)
+	if err != nil {
+		return fmt.Errorf("error creating invites table: %w", err)
+	}
+
+	// Create task_runs table
+	_, err = sdb.Exec(`
+		CREATE TABLE IF NOT EXISTS task_runs (
+			task_id TEXT PRIMARY KEY NOT NULL,
+			last_run_at DATETIME,
+			last_run_success BOOLEAN,
+			last_run_duration INTEGER,
+			next_run_at DATETIME,
+			next_run_type TEXT NOT NULL DEFAULT 'single'
+		)
+	`)
+	if err != nil {
+		return fmt.Errorf("error creating task_runs table: %w", err)
+	}
+
+	// Create state_consumer table
+	_, err = sdb.Exec(`
+		CREATE TABLE IF NOT EXISTS consumer_state (
+			name TEXT PRIMARY KEY,
+			last_processed_stream_seq INTEGER,
+			updated_at DATETIME NOT NULL
+		)
+	`)
+	if err != nil {
+		return fmt.Errorf("error creating state_consumer table: %w", err)
+	}
+
+	return nil
+}

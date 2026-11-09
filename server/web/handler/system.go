@@ -1,0 +1,34 @@
+// SPDX-License-Identifier: MPL-2.0
+
+package handler
+
+import (
+	"net/http"
+	"shaper/server/core"
+
+	"github.com/labstack/echo/v4"
+)
+
+func GetSystemConfig(app *core.App) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		return c.JSON(http.StatusOK, map[string]any{
+			"loginRequired":                   app.LoginRequired,
+			"tasksEnabled":                    !app.NoTasks,
+			"editEnabled":                     !app.NoEdit,
+			"apiKeysEnabled":                  !app.NoAPIKeys,
+			"ingestEnabled":                   !app.NoIngest,
+			"publicSharingEnabled":            !app.NoPublicSharing,
+			"passwordProtectedSharingEnabled": !app.NoPasswordProtectedSharing,
+			"ssoLoginUrl":                     app.SSOLoginURL,
+			"jwtSecretStatic":                 app.JWTSecretStatic,
+		})
+	}
+}
+
+func GetVersion(app *core.App) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		return c.JSON(http.StatusOK, map[string]string{
+			"version": app.Version,
+		})
+	}
+}

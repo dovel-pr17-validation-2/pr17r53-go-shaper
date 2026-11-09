@@ -1,0 +1,374 @@
+// SPDX-License-Identifier: MPL-2.0
+
+import type { ECharts } from "echarts/core";
+import * as echarts from "echarts/core";
+
+// Helper function to get computed CSS value
+export const getComputedCssValue = (
+  cssVar: string,
+  target?: Element | string | null,
+): string => {
+  if (typeof document === "undefined") return `var(${cssVar})`;
+
+  let el: Element | null = null;
+  if (typeof target === "string") {
+    try {
+      const safeId = typeof CSS !== "undefined" && CSS.escape ? CSS.escape(target) : target;
+      el = document.querySelector(`[data-chart-id="${safeId}"]`);
+    } catch {
+      el = null;
+    }
+    if (!el) {
+      try {
+        el = document.querySelector(target);
+      } catch {
+        // target is not a valid CSS selector (e.g. chartId like "3-1")
+        el = null;
+      }
+    }
+    if (!el) {
+      try {
+        el = document.getElementById(target);
+      } catch {
+        el = null;
+      }
+    }
+  } else if (target) {
+    el = target;
+  }
+
+  // Find the closest dashboard container, or fallback to the first .shaper-scope (preferring non-html dashboard div), or documentElement
+  const scopedEl =
+    el?.closest?.(".shaper-scope") ??
+    el ??
+    document.querySelector(".shaper-scope:not(html)") ??
+    document.querySelector(".shaper-scope") ??
+    document.documentElement;
+
+  const getStyle =
+    typeof window !== "undefined" && window.getComputedStyle
+      ? window.getComputedStyle
+      : typeof getComputedStyle === "function"
+        ? getComputedStyle
+        : null;
+
+  if (!scopedEl || !getStyle) return `var(${cssVar})`;
+
+  const computedValue = getStyle(scopedEl).getPropertyValue(cssVar).trim();
+  if (computedValue) return computedValue;
+
+  // Fallback to documentElement if scoped element did not define it and did not inherit
+  if (scopedEl !== document.documentElement) {
+    const rootValue = getStyle(document.documentElement).getPropertyValue(cssVar).trim();
+    if (rootValue) return rootValue;
+  }
+
+  return `var(${cssVar})`;
+};
+
+export const getChartFont = (target?: Element | string | null): string => {
+  if (typeof window === "undefined") return "sans-serif";
+  const font = getComputedCssValue("--shaper-font", target);
+  return font && !font.startsWith("var(--") ? font : "sans-serif";
+};
+
+export const getDisplayFont = (target?: Element | string | null): string => {
+  if (typeof window === "undefined") return "sans-serif";
+  const font = getComputedCssValue("--shaper-display-font", target);
+  return font && !font.startsWith("var(--") ? font : "sans-serif";
+};
+
+// Function to get theme-appropriate colors
+export const getThemeColors = (isDark: boolean, target?: Element | string | null) => {
+  if (isDark) {
+    return {
+      primaryColor: getComputedCssValue("--shaper-dark-mode-primary-color-alternate", target),
+      backgroundColor: getComputedCssValue("--shaper-dark-mode-background-color", target),
+      backgroundColorSecondary: getComputedCssValue("--shaper-dark-mode-background-color-secondary", target),
+      backgroundColorInverted: getComputedCssValue("--shaper-dark-mode-background-color-invert", target),
+      backgroundColorAlternate: getComputedCssValue("--shaper-dark-mode-background-color-alternate", target),
+      borderColor: getComputedCssValue("--shaper-dark-mode-border-color", target),
+      textColor: getComputedCssValue("--shaper-dark-mode-text-color", target),
+      textColorSecondary: getComputedCssValue("--shaper-dark-mode-text-color-secondary", target),
+      textColorInverted: getComputedCssValue("--shaper-dark-mode-text-color-invert", target),
+      referenceLineColor: getComputedCssValue("--shaper-reference-line-color", target),
+    };
+  } else {
+    return {
+      primaryColor: getComputedCssValue("--shaper-primary-color-alternate", target),
+      backgroundColor: getComputedCssValue("--shaper-background-color", target),
+      backgroundColorSecondary: getComputedCssValue("--shaper-background-color-secondary", target),
+      backgroundColorInverted: getComputedCssValue("--shaper-background-color-invert", target),
+      backgroundColorAlternate: getComputedCssValue("--shaper-background-color-alternate", target),
+      borderColor: getComputedCssValue("--shaper-border-color", target),
+      textColor: getComputedCssValue("--shaper-text-color", target),
+      textColorSecondary: getComputedCssValue("--shaper-text-color-secondary", target),
+      textColorInverted: getComputedCssValue("--shaper-text-color-invert", target),
+      referenceLineColor: getComputedCssValue("--shaper-reference-line-color", target),
+    };
+  }
+};
+
+// Function to download chart as image
+export const downloadChartAsImage = async (
+  chartInstance: ECharts,
+  isDarkMode: boolean,
+  chartId: string,
+  label?: string,
+): Promise<void> => {
+  // Get the current chart's dimensions and options
+  const chartDom = chartInstance.getDom();
+  const { width, height } = chartDom.getBoundingClientRect();
+  const chartOptions = chartInstance.getOption() as any;
+  chartOptions.animation = false;
+
+  // Check for watermark URL in CSS variables
+  const watermarkUrlRaw = getComputedCssValue("--shaper-watermark-url", chartDom);
+  let watermarkUrl = "";
+  if (
+    watermarkUrlRaw &&
+    watermarkUrlRaw !== "none" &&
+    watermarkUrlRaw !== "var(--shaper-watermark-url)"
+  ) {
+    const match = watermarkUrlRaw.match(/url\(['"]?(.*?)['"]?\)/);
+    watermarkUrl = match ? match[1] : watermarkUrlRaw;
+  }
+
+  const watermarkGap = 10;
+  const watermarkHeight = 17;
+  const watermarkPadding = 5;
+  const newHeight = height + watermarkGap * 2 + watermarkHeight + watermarkPadding;
+
+  if (watermarkUrl) {
+    // Adjust grid to keep it at the same position from top
+    if (chartOptions.grid) {
+      const grids = Array.isArray(chartOptions.grid)
+        ? chartOptions.grid
+        : [chartOptions.grid];
+      const spaceBottom = watermarkGap + watermarkHeight + watermarkPadding;
+      grids.forEach((grid: any) => {
+        if (grid.bottom !== undefined) {
+          if (typeof grid.bottom === "number") {
+            grid.bottom += spaceBottom;
+          } else if (
+            typeof grid.bottom === "string" &&
+            grid.bottom.endsWith("px")
+          ) {
+            grid.bottom = `${parseFloat(grid.bottom) + spaceBottom}px`;
+          }
+        } else {
+          grid.bottom = spaceBottom;
+        }
+        if (grid.top !== undefined) {
+          if (typeof grid.top === "number") {
+            grid.top += watermarkGap;
+          } else if (
+            typeof grid.top === "string" &&
+            grid.top.endsWith("px")
+          ) {
+            grid.top = `${parseFloat(grid.top) + watermarkGap}px`;
+          }
+        } else {
+          grid.top = watermarkGap;
+        }
+      });
+    }
+    if (chartOptions.legend) {
+      const legends = Array.isArray(chartOptions.legend)
+        ? chartOptions.legend
+        : [chartOptions.legend];
+      legends.forEach((legend: any) => {
+        if (legend.top !== undefined) {
+          if (typeof legend.top === "number") {
+            legend.top += watermarkGap;
+          } else if (
+            typeof legend.top === "string" &&
+            legend.top.endsWith("px")
+          ) {
+            legend.top = `${parseFloat(legend.top) + watermarkGap}px`;
+          }
+        } else {
+          legend.top = watermarkGap;
+        }
+      });
+    }
+
+    // Pre-load image to ensure it's rendered in getDataURL and to get its dimensions
+    let imgWidth = 0;
+    await new Promise((resolve) => {
+      const img = new Image();
+      img.onload = () => {
+        const aspectRatio = img.naturalWidth / img.naturalHeight;
+        imgWidth = watermarkHeight * aspectRatio;
+        resolve(null);
+      };
+      img.onerror = () => resolve(null);
+      img.src = watermarkUrl;
+      setTimeout(() => resolve(null), 2000); // Timeout after 2 seconds
+    });
+
+    // Add watermark graphic
+    const watermarkGraphic = {
+      type: "image",
+      right: watermarkPadding,
+      bottom: watermarkPadding,
+      style: {
+        image: watermarkUrl,
+        height: watermarkHeight,
+        width: imgWidth || undefined,
+      },
+      z: 1000,
+    };
+
+    if (!chartOptions.graphic) {
+      chartOptions.graphic = [watermarkGraphic];
+    } else if (Array.isArray(chartOptions.graphic)) {
+      if (chartOptions.graphic.length === 1 && Array.isArray(chartOptions.graphic[0].elements)) {
+        chartOptions.graphic[0].elements.push(watermarkGraphic);
+      } else {
+        chartOptions.graphic = [...chartOptions.graphic, watermarkGraphic];
+      }
+    } else {
+      chartOptions.graphic = [chartOptions.graphic, watermarkGraphic];
+    }
+  }
+
+  // Create a temporary container for the canvas chart
+  const tempContainer = document.createElement("div");
+  tempContainer.style.position = "absolute";
+  tempContainer.style.top = "-9999px";
+  tempContainer.style.left = "-9999px";
+  tempContainer.style.width = `${width}px`;
+  tempContainer.style.height = `${newHeight}px`;
+  document.body.appendChild(tempContainer);
+
+  // Create a temporary chart with canvas renderer
+  const tempChart = echarts.init(tempContainer, null, {
+    renderer: "canvas",
+    width: width,
+    height: newHeight,
+  });
+
+  // Apply the same options to the temporary chart
+  tempChart.setOption(chartOptions);
+
+  try {
+    const url = tempChart.getDataURL({
+      type: "png",
+      pixelRatio: 2,
+      backgroundColor: getThemeColors(isDarkMode, chartDom).backgroundColorSecondary,
+    });
+
+    const link = document.createElement("a");
+
+    // Generate a simple filename
+    const timestamp = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+    const filename = label
+      ? `${label.replace(/[^a-z0-9]/gi, "_").toLowerCase()}-${timestamp}.png`
+      : `chart-${chartId}-${timestamp}.png`;
+
+    link.download = filename;
+    link.href = url;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+  } finally {
+    // Clean up: dispose the temporary chart and remove the container
+    tempChart.dispose();
+    document.body.removeChild(tempContainer);
+  }
+};
+
+// ECharts color utilities
+const echartsColors = {
+  primary: {
+    light: "var(--shaper-primary-color-alternate)",
+    dark: "var(--shaper-dark-mode-primary-color-alternate)",
+  },
+  color2: {
+    light: "var(--shaper-color-two)",
+    dark: "var(--shaper-color-two)",
+  },
+  color3: {
+    light: "var(--shaper-color-three)",
+    dark: "var(--shaper-color-three)",
+  },
+  color4: {
+    light: "var(--shaper-color-four)",
+    dark: "var(--shaper-color-four)",
+  },
+  color5: {
+    light: "var(--shaper-color-five)",
+    dark: "var(--shaper-color-five)",
+  },
+  color6: {
+    light: "var(--shaper-color-six)",
+    dark: "var(--shaper-color-six)",
+  },
+  color7: {
+    light: "var(--shaper-color-seven)",
+    dark: "var(--shaper-color-seven)",
+  },
+} as const;
+
+const echartsColorKeys = Object.keys(echartsColors) as Array<
+  keyof typeof echartsColors
+>;
+
+export type EChartsColorKey = keyof typeof echartsColors;
+
+export const AvailableEChartsColors: EChartsColorKey[] = Object.keys(
+  echartsColors,
+) as Array<EChartsColorKey>;
+
+export const toSingleLine = <T extends string | number | null | undefined>(text: T): T => {
+  if (typeof text !== "string") return text;
+  return text.replace(/\r?\n|\r/g, " ") as T;
+};
+
+export const constructCategoryColors = (
+  categories: string[],
+  colorsByCategory: Record<string, string>,
+  isDark: boolean,
+  target?: Element | string | null,
+): Map<string, string> => {
+  const categoryColors = new Map<string, string>();
+  let customColorCount = 0;
+  categories.forEach((category, index) => {
+    const cleanCategory = toSingleLine(category);
+    let color = colorsByCategory[category] ?? colorsByCategory[cleanCategory];
+    if (!color) {
+      const echartsKey =
+        echartsColors[
+          echartsColorKeys[(index - customColorCount) % echartsColorKeys.length]
+        ];
+      const cssVar = echartsKey[isDark ? "dark" : "light"];
+      color = getComputedCssValue(cssVar.replace("var(", "").replace(")", ""), target);
+    } else {
+      customColorCount += 1;
+    }
+    categoryColors.set(cleanCategory, color);
+    categoryColors.set(category, color);
+  });
+  return categoryColors;
+};
+
+export const getEChartsColor = (
+  colorKey: EChartsColorKey,
+  isDark: boolean = false,
+  target?: Element | string | null,
+): string => {
+  const color = echartsColors[colorKey];
+  if (!color) {
+    const fallbackVar = isDark
+      ? "--shaper-dark-mode-primary-color-alternate"
+      : "--shaper-primary-color-alternate";
+    return getComputedCssValue(fallbackVar, target);
+  }
+
+  const cssVar = isDark ? color.dark : color.light;
+  // Extract the CSS variable name from the var() function
+  const varName = cssVar.replace("var(", "").replace(")", "");
+
+  return getComputedCssValue(varName, target);
+};

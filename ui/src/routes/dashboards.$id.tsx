@@ -1,0 +1,261 @@
+// SPDX-License-Identifier: MPL-2.0
+
+import { z } from "zod";
+import { createFileRoute, isRedirect, Link } from "@tanstack/react-router";
+import { ErrorComponent } from "../components/ErrorComponent";
+import type { ErrorComponentProps } from "@tanstack/react-router";
+import { RiPencilLine, RiFileCopyLine } from "@remixicon/react";
+import { Dashboard } from "../components/dashboard";
+import { Helmet } from "react-helmet";
+import { useNavigate } from "@tanstack/react-router";
+import {
+  VarsParamSchema,
+  varsParamSchema,
+  copyToClipboard,
+} from "../lib/utils";
+import { useAuth, getJwt } from "../lib/auth";
+import { useCallback, useState, useRef, useEffect } from "react";
+import { Result } from "../lib/types";
+import { MenuProvider } from "../components/providers/MenuProvider";
+import { MenuTrigger } from "../components/MenuTrigger";
+import { VariablesMenu } from "../components/VariablesMenu";
+import { PublicLink } from "../components/PublicLink";
+import { useToast } from "../hooks/useToast";
+import { Button } from "../components/tremor/Button";
+import { useQueryApi } from "../hooks/useQueryApi";
+import { DashboardWrapper } from "../components/DashboardWrapper";
+import { getSystemConfig } from "../lib/system";
+import { useRecentApps } from "../hooks/useRecentApps";
+
+export const Route = createFileRoute("/dashboards/$id")({
+  validateSearch: z.object({
+    vars: varsParamSchema,
+    dev: z.string().optional(),
+    preview: z.union([z.string(), z.boolean()]).optional(),
+  }),
+  errorComponent: DashboardErrorComponent,
+  notFoundComponent: () => {
+    return (
+      <div>
+        <p>Dashboard not found</p>
+        <Link to="/" className="underline">
+          Go to homepage
+        </Link>
+      </div>
+    );
+  },
+  component: DashboardViewComponent,
+});
+
+function DashboardErrorComponent ({ error }: ErrorComponentProps) {
+  return <ErrorComponent error={error} />;
+}
+function DashboardViewComponent () {
+  const { vars, dev, preview } = Route.useSearch();
+  const isPreview = Boolean(dev || preview);
+  const params = Route.useParams();
+  const auth = useAuth();
+  const navigate = useNavigate({ from: "/dashboards/$id" });
+  const queryApi = useQueryApi();
+  const [title, setTitle] = useState("Dashboard");
+  const [visibility, setVisibility] = useState<Result["visibility"]>(undefined);
+  const [unsetVariables, setUnsetVariables] = useState<string[]>([]);
+  const [path, setPath] = useState("/");
+  const { toast } = useToast();
+  const [dashboardKey, setDashboardKey] = useState(0); // For forcing dashboard re-render
+  const { addRecentApp } = useRecentApps();
+
+  // Ref for dashboard ID text selection
+  const dashboardIdRef = useRef<HTMLElement>(null);
+
+  // Fetch dashboard query to get path
+  useEffect(() => {
+    const fetchDashboardQuery = async () => {
+      try {
+        const dashboard = await queryApi(`dashboards/${params.id}/info`);
+        if (dashboard.path) {
+          setPath(dashboard.path);
+        }
+        setTitle(dashboard.name);
+        addRecentApp(params.id, dashboard.name, "dashboard", dashboard.path);
+      } catch (err) {
+        if (isRedirect(err)) {
+          navigate(err.options);
+        }
+        // If fetching fails, keep default path "/"
+      }
+    };
+    fetchDashboardQuery();
+  }, [params.id, queryApi, navigate, addRecentApp]);
+
+  // WebSocket connection for dev mode live reload
+  useEffect(() => {
+    if (!dev || !dev.startsWith("ws://")) {
+      return;
+    }
+
+    const wsUrl = `${dev}?dashboardId=${params.id}`;
+    const ws = new WebSocket(wsUrl);
+
+    ws.onopen = () => {
+      console.log("Dev mode websocket connected");
+    };
+
+    ws.onmessage = (event) => {
+      try {
+        const message = JSON.parse(event.data);
+        if (message.type === "reload" && message.dashboardId === params.id) {
+          console.log("Reloading dashboard due to file change");
+          // Force dashboard re-render by updating key
+          setDashboardKey(prev => prev + 1);
+        }
+      } catch (err) {
+        console.error("Error parsing websocket message:", err);
+      }
+    };
+
+    ws.onclose = () => {
+      console.log("Dev mode websocket disconnected");
+    };
+
+    ws.onerror = (error) => {
+      console.error("WebSocket error:", error);
+    };
+
+    return () => {
+      ws.close();
+    };
+  }, [dev, params.id]);
+
+  const handleRedirectError = useCallback(
+    (err: Error) => {
+      if (isRedirect(err)) {
+        navigate(err.options);
+      }
+    },
+    [navigate],
+  );
+
+  const handleVarsChanged = useCallback(
+    (newVars: VarsParamSchema) => {
+      navigate({
+        search: (old) => ({
+          ...old,
+          vars: newVars,
+        }),
+        resetScroll: false,
+        replace: true,
+      });
+    },
+    [navigate],
+  );
+
+  const handleCopyDashboardId = async () => {
+    const success = await copyToClipboard(params.id);
+    if (success) {
+      toast({
+        title: "Dashboard ID copied",
+        description: "Dashboard ID copied to clipboard",
+      });
+    } else {
+      toast({
+        title: "Error",
+        description: "Failed to copy dashboard ID",
+        variant: "error",
+      });
+    }
+  };
+
+  const handleDashboardIdClick = () => {
+    if (dashboardIdRef.current) {
+      const selection = window.getSelection();
+      const range = document.createRange();
+      range.selectNodeContents(dashboardIdRef.current);
+      selection?.removeAllRanges();
+      selection?.addRange(range);
+    }
+  };
+
+  const menuTitle = title;
+  const systemConfig = getSystemConfig();
+  const MenuButton = (
+    <MenuTrigger className="-ml-1 mt-0.5 py-[6px] xl:fixed xl:top-1 xl:left-2 xl:ml-0" title={menuTitle}>
+      {!isPreview && (
+        <>
+          {systemConfig.editEnabled && (
+            <Link
+              to="/dashboards/$id/edit"
+              params={{ id: params.id }}
+              search={() => ({ vars })}
+              className="block px-4 py-3 hover:underline"
+            >
+              <RiPencilLine className="size-4 inline mr-1.5 mb-1" />
+              Edit Dashboard
+            </Link>
+          )}
+          <div className="mt-6 px-4">
+            <div className="text-sm font-medium text-ctext2 dark:text-dtext2 mb-2">
+              Dashboard ID
+            </div>
+            <div className="flex items-center space-x-2">
+              <code
+                ref={dashboardIdRef}
+                onClick={handleDashboardIdClick}
+                className="flex-grow px-2 py-1.5 bg-cbgs dark:bg-dbgs border border-cb dark:border-db rounded text-xs font-mono text-ctext dark:text-dtext overflow-hidden text-ellipsis whitespace-nowrap cursor-pointer hover:bg-cbga dark:hover:bg-dbga transition-colors"
+              >
+                {params.id}
+              </code>
+              <Button
+                onClick={handleCopyDashboardId}
+                variant="secondary"
+                className="px-2 py-1.5 flex-shrink-0"
+              >
+                <RiFileCopyLine className="size-4" />
+              </Button>
+            </div>
+          </div>
+        </>
+      )}
+      <VariablesMenu unsetVariables={unsetVariables} />
+      {(visibility === "public" || visibility === "password-protected") && (
+        <div className="my-2 px-4">
+          <PublicLink href={`../view/${params.id}`} />
+        </div>
+      )}
+    </MenuTrigger>
+  );
+
+  const onDataChange = useCallback((data: Result) => {
+    setVisibility(data.visibility);
+    setUnsetVariables(data.unsetVariables || []);
+  }, []);
+
+  return (
+    <MenuProvider currentPath={path}>
+      <Helmet>
+        <title>{title}</title>
+        <meta name="description" content={title} />
+      </Helmet>
+
+      <DashboardWrapper className="h-dvh relative">
+        <Dashboard
+          id={params.id}
+          vars={vars}
+          hash={`${auth.hash}-${dashboardKey}`}
+          getJwt={getJwt}
+          menuButton={MenuButton}
+          onVarsChanged={handleVarsChanged}
+          onError={handleRedirectError}
+          onDataChange={onDataChange}
+        />
+        {isPreview && (
+          <div
+            className="fixed top-1 left-1 px-2.5 py-2 text-xs font-mono cursor-help bg-cerr dark:bg-derr text-ctextb dark:text-dtextb opacity-80 pointer-events-none z-50"
+          >
+            Preview
+          </div>
+        )}
+      </DashboardWrapper>
+    </MenuProvider>
+  );
+}

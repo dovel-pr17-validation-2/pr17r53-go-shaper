@@ -1,0 +1,826 @@
+// SPDX-License-Identifier: MPL-2.0
+
+import React, { useEffect, useCallback, useRef } from "react";
+import type { ECharts } from "echarts/core";
+import type { BarSeriesOption } from "echarts/charts";
+import {
+  constructCategoryColors,
+  getThemeColors,
+  getChartFont,
+  getDisplayFont,
+  toSingleLine,
+} from "../../lib/chartUtils";
+import { cx } from "../../lib/utils";
+import { ChartHoverContext } from "../../contexts/ChartHoverContext";
+import { DarkModeContext } from "../../contexts/DarkModeContext";
+import { Column, isDatableType, MarkLine } from "../../lib/types";
+import { formatValue, echartsEncode } from "../../lib/render";
+import { safeColor } from "../../lib/safeColor";
+import { translate } from "../../lib/translate";
+import { EChart } from "./EChart";
+
+const chartPadding = 16;
+
+interface BarChartProps extends React.HTMLAttributes<HTMLDivElement> {
+  chartId: string;
+  label?: string;
+  subtitle?: string;
+  data: Record<string, any>[];
+  extraDataByIndexAxis: Record<string, Record<string, any>>;
+  index: string;
+  indexType: Column["type"];
+  valueType: Column["type"];
+  categories: string[];
+  colorsByCategory: Record<string, string>;
+  valueFormatter: (value: number, shortFormat?: boolean | number) => string;
+  indexFormatter: (value: number | string, shortFormat?: boolean | number) => string;
+  showLegend?: boolean;
+  xAxisLabel?: string;
+  yAxisLabel?: string;
+  layout: "vertical" | "horizontal";
+  type: "default" | "stacked";
+  markLines?: MarkLine[];
+}
+
+const BarChart = (props: BarChartProps) => {
+  const {
+    data,
+    extraDataByIndexAxis,
+    categories,
+    colorsByCategory,
+    index,
+    indexType,
+    valueType,
+    valueFormatter,
+    indexFormatter,
+    showLegend = true,
+    className,
+    xAxisLabel,
+    yAxisLabel,
+    layout,
+    type,
+    chartId,
+    label,
+    subtitle,
+    markLines,
+    ...other
+  } = props;
+
+  const chartRef = useRef<ECharts | null>(null);
+  const hoveredChartIdRef = useRef<string | null>(null);
+  const [chartWidth, setChartWidth] = React.useState(450);
+  const [chartHeight, setChartHeight] = React.useState(300);
+
+  const { hoveredIndex, hoveredChartId, hoveredIndexType, setHoverState } =
+    React.useContext(ChartHoverContext);
+
+  const { isDarkMode } = React.useContext(DarkModeContext);
+
+  const isHovering = React.useMemo(() => {
+    if (hoveredIndex != null && hoveredIndexType === indexType && hoveredChartId != null && hoveredChartId !== chartId) {
+      return hoveredIndex;
+    }
+    return null;
+  }, [hoveredIndex, hoveredIndexType, indexType, hoveredChartId, chartId]);
+
+  // Update hoveredChartId ref whenever it changes
+  useEffect(() => {
+    hoveredChartIdRef.current = hoveredChartId;
+  }, [hoveredChartId]);
+
+  // Memoize the chart options to prevent unnecessary re-renders
+  const chartOptions = React.useMemo(() => {
+    // Get computed colors for theme
+    const { borderColor, textColor, textColorSecondary, referenceLineColor, backgroundColorSecondary, textColorInverted, backgroundColorInverted } = getThemeColors(isDarkMode, chartId);
+    const chartFont = getChartFont(chartId);
+    const displayFont = getDisplayFont(chartId);
+    const cleanXAxisLabel = toSingleLine(xAxisLabel);
+    const cleanYAxisLabel = toSingleLine(yAxisLabel);
+    const cleanCategories = categories.map(toSingleLine);
+    const categoryColors = constructCategoryColors(cleanCategories, colorsByCategory, isDarkMode, chartId);
+    const isTimestampData = isDatableType(indexType);
+    const isNumericData = indexType === "number" || indexType === "percent";
+    const isContinuousData = isTimestampData || isNumericData;
+
+    // We treat vertical timestamp data as categories.
+    let dataCopy = data;
+    if (layout === "vertical" && isDatableType(indexType)) {
+      dataCopy = data.map((item) => {
+        return {
+          ...item,
+          // Since we treat index as category, it will be converted to text. Cannot keep date in the original number format.
+          [index]: new Date(item[index]).toISOString(),
+        };
+      });
+    }
+
+    // Set up chart options
+    const series: BarSeriesOption[] = cleanCategories.map((category, catIndex) => {
+      const origCategory = categories[catIndex] ?? category;
+      return {
+        name: category,
+        id: category,
+        type: "bar" as const,
+        barGap: "3%",
+        barMaxWidth: dataCopy.length === 1 ? layout == "horizontal" ? "50%" : "25%" : undefined,
+        stack: type === "stacked" ? "stack" : category,
+        cursor: "crosshair",
+        data: isContinuousData && layout === "horizontal"
+          ? dataCopy.map((item) => {
+            const sc = safeColor(item._color);
+            const val = item[category] ?? item[origCategory];
+            return sc && val != null
+              ? { value: [item[index], val], itemStyle: { color: sc } }
+              : [item[index], val];
+          })
+          : dataCopy.map((item) => {
+            const sc = safeColor(item._color);
+            const val = item[category] ?? item[origCategory];
+            return sc && val != null
+              ? { value: val, itemStyle: { color: sc } }
+              : val;
+          }),
+        itemStyle: {
+          color: categoryColors.get(category),
+        },
+        emphasis: {
+          focus: "series",
+        },
+        animationDelay: 100,
+        animationDelayUpdate: 100,
+      };
+    });
+
+    if (markLines) {
+      let foundEventLine = false;
+      let multiEventLines = false;
+      for (const m of markLines) {
+        const isEventLine = !m.isYAxis && layout === "horizontal";
+        if (isEventLine) {
+          if (foundEventLine) {
+            multiEventLines = true;
+            break;
+          }
+          foundEventLine = true;
+        }
+      }
+      series.push({
+        type: "bar" as const,
+        stack: type === "stacked" ? "stack" : categories[0],
+        markLine: {
+          silent: true,
+          symbol: "none",
+          animation: false,
+          data: markLines.filter(m => !m.isYAxis || layout === "horizontal").map(m => {
+            const isGoalLine = m.isYAxis || layout === "vertical";
+            return {
+              xAxis: m.isYAxis ? undefined : m.value,
+              yAxis: m.isYAxis ? m.value : undefined,
+              symbol: isGoalLine ? "none" : "circle",
+              symbolSize: 6.5,
+              lineStyle: {
+                color: textColorSecondary,
+                type: "dashed",
+                width: isGoalLine ? 1.2 : 1.0,
+                opacity: isGoalLine ? 0.5 : 0.8,
+              },
+              label: {
+                formatter: m.label,
+                position: isGoalLine ? "insideStartTop" : multiEventLines ? "insideEnd" : "end",
+                distance: isGoalLine ? 1.5 : multiEventLines ? 5 : 3.8,
+                color: textColorSecondary,
+                fontFamily: chartFont,
+                fontWeight: 500,
+                fontSize: 11,
+                opacity: isGoalLine ? 0.5 : 0.8,
+                width: m.isYAxis ? chartWidth / 3 : chartHeight / 2,
+                overflow: "truncate",
+                textBorderColor: backgroundColorSecondary,
+                textBorderWidth: !isGoalLine && multiEventLines ? 2 : 0,
+              },
+            };
+          }),
+        },
+      });
+    }
+
+    const numLegendItems = cleanCategories.filter(c => c.length > 0).length;
+    const avgLegendCharCount = numLegendItems > 0 ? cleanCategories.reduce((acc, c) => acc + c.length, 0) / numLegendItems : 0;
+    const minLegendItemWidth = Math.max(avgLegendCharCount * 8, 50);
+    const legendPaddingLeft = 5;
+    const legendPaddingRight = 5;
+    const legendItemGap = 10;
+    const legendWidth = chartWidth - legendPaddingLeft - legendPaddingRight;
+    const halfLegendItems = Math.max(1, Math.ceil(numLegendItems / 2));
+    const legendItemWidth = numLegendItems <= 1
+      ? legendWidth
+      : (legendWidth - (legendItemGap * (halfLegendItems - 1))) / halfLegendItems;
+    const canFitLegendItems = legendItemWidth >= minLegendItemWidth;
+    const legendTopOffset = (showLegend ? (numLegendItems === 0 || legendWidth / numLegendItems >= minLegendItemWidth ? 36 : 58) : 0);
+    let labelTopOffset = label ? 40 + 15 * (Math.ceil(label.length / (0.125 * chartWidth)) - 1) : 10;
+    if (subtitle) {
+      const subtitleLines = Math.max(1, Math.ceil(subtitle.length / (0.15 * chartWidth)));
+      if (label) {
+        labelTopOffset += 4 + subtitleLines * 16;
+      } else {
+        labelTopOffset = 25 + subtitleLines * 16;
+      }
+    }
+    const spaceForXaxisLabel = 10 + (cleanXAxisLabel ? 25 : 0);
+    const xData = layout === "horizontal" && !isContinuousData ? dataCopy.map((item) => item[index]) : undefined;
+    const rawCustomValues = layout === "horizontal" && isContinuousData
+      ? Array.from(new Set(dataCopy.map((item) => item[index]).filter((val) => val != null))).sort((a, b) => {
+        const numA = typeof a === "number" ? a : new Date(a).getTime();
+        const numB = typeof b === "number" ? b : new Date(b).getTime();
+        return numA - numB;
+      })
+      : undefined;
+    const xValues = layout === "horizontal" ? (isContinuousData ? rawCustomValues : xData) : undefined;
+    const xSpace = (chartWidth - 2 * chartPadding + (cleanYAxisLabel ? 50 : 30));
+    const shortenLabel = layout === "horizontal" ? xValues && xValues.length > 0 ? (xSpace / xValues.length) * (0.10 + (0.00004 * xSpace)) : true : false;
+    let maxLabelLen = 0;
+    (xValues ?? []).forEach(x => {
+      const v = layout === "horizontal" ? indexFormatter(indexType === "duration" || indexType === "time" ? new Date(x).getTime() : x, shortenLabel) : valueFormatter(x, true);
+      if (v.length > maxLabelLen) {
+        maxLabelLen = v.length;
+      }
+    });
+    const hasManyLabels = typeof shortenLabel === "number" && shortenLabel <= 12;
+    const shouldRotateXLabel = !isContinuousData && !cleanXAxisLabel && hasManyLabels;
+    const isEmpty = dataCopy.length === 0;
+    const customValues = hasManyLabels || isEmpty ? undefined : rawCustomValues;
+
+    return {
+      title: {
+        text: label,
+        textStyle: {
+          fontSize: 15,
+          lineHeight: 15,
+          fontFamily: displayFont,
+          fontWeight: 600,
+          color: textColor,
+          width: chartWidth - 10 - 2 * chartPadding,
+          overflow: "break",
+        },
+        subtext: subtitle,
+        subtextStyle: {
+          fontSize: 12,
+          lineHeight: 14,
+          fontFamily: chartFont,
+          color: textColorSecondary,
+          width: chartWidth - 10 - 2 * chartPadding,
+          overflow: "break",
+        },
+        itemGap: 4,
+        left: chartPadding,
+        top: chartPadding,
+      },
+      tooltip: {
+        show: !isEmpty,
+        trigger: "axis",
+        triggerOn: "mousemove",
+        enterable: false,
+        confine: true,
+        hideDelay: 200, // Increase hide delay to prevent flickering
+        showDelay: 0, // Show immediately
+        borderRadius: 5,
+        borderWidth: 0,
+        backgroundColor: backgroundColorSecondary,
+        textStyle: {
+          fontFamily: chartFont,
+          color: textColor,
+        },
+        formatter: (params: any) => {
+          const indexDim = layout === "horizontal" ? "x" : "y";
+          const axisData = params.find((item: any) => item?.axisDim === indexDim);
+          const hoverValue = axisData?.axisValue;
+          const title = indexFormatter(indexType === "duration" || indexType === "time" ? new Date(hoverValue).getTime() : hoverValue, xSpace / 6.5);
+
+          let tooltipContent = `<div class="text-sm font-medium">${echartsEncode(title)}</div>`;
+
+          if (type === "stacked" && (valueType === "number" || valueType === "duration")) {
+            const total = params.reduce((sum: number, item: any) => {
+              if (item.axisDim !== indexDim) {
+                return sum; // Skip non-index axis items
+              }
+              let value: number;
+              if (isContinuousData && layout === "horizontal" && Array.isArray(item.value) && item.value.length >= 2) {
+                value = item.value[1] as number;
+              } else {
+                value = item.value as number;
+              }
+
+              // Only include valid values in the total
+              if (value === null || value === undefined || isNaN(value)) {
+                return sum;
+              }
+
+              return sum + value;
+            }, 0);
+            tooltipContent += `<div class="flex justify-between space-x-2 mt-2">
+              <span class="font-medium">${echartsEncode(translate("TOTAL"))}</span>
+              <span>${echartsEncode(valueFormatter(total))}</span>
+            </div>`;
+          }
+
+          const extraData = extraDataByIndexAxis[hoverValue];
+
+          const getExtraDataForCategory = (categoryName: string) => {
+            if (!extraData) return null;
+            const firstVal = Object.values(extraData)[0];
+            if (firstVal && typeof firstVal === "object" && !Array.isArray(firstVal)) {
+              return extraData[categoryName] ?? extraData[categories[cleanCategories.indexOf(categoryName)]];
+            }
+            if (categoryName === "" || cleanCategories.length <= 1) {
+              return extraData;
+            }
+            return null;
+          };
+
+          const globalFields = new Set<string>();
+          const fieldValuesAcrossCategories: Record<string, string[]> = {};
+          const fieldRawData: Record<string, [any, Column["type"]]> = {};
+
+          if (extraData) {
+            const firstVal = Object.values(extraData)[0];
+            const isNested = firstVal && typeof firstVal === "object" && !Array.isArray(firstVal);
+
+            if (isNested) {
+              Object.values(extraData).forEach((fieldsObj) => {
+                if (fieldsObj && typeof fieldsObj === "object") {
+                  Object.entries(fieldsObj).forEach(([fieldName, valueData]) => {
+                    if (Array.isArray(valueData) && valueData.length >= 2) {
+                      const [value, columnType] = valueData;
+                      const formatted = formatValue(value, columnType, true).toString();
+                      if (!fieldValuesAcrossCategories[fieldName]) {
+                        fieldValuesAcrossCategories[fieldName] = [];
+                        fieldRawData[fieldName] = valueData as [any, Column["type"]];
+                      }
+                      fieldValuesAcrossCategories[fieldName].push(formatted);
+                    }
+                  });
+                }
+              });
+
+              const totalCategoriesWithExtra = Object.keys(extraData).filter(c => c !== "").length;
+              Object.entries(fieldValuesAcrossCategories).forEach(([fieldName, list]) => {
+                const allSame = list.every(val => val === list[0]);
+                const isGlobal = allSame && (totalCategoriesWithExtra <= 1 || list.length === totalCategoriesWithExtra);
+                if (isGlobal) {
+                  globalFields.add(fieldName);
+                }
+              });
+            }
+          }
+
+          let hasGlobalExtra = false;
+          let globalExtraContent = "";
+          if (extraData) {
+            const firstVal = Object.values(extraData)[0];
+            const isNested = firstVal && typeof firstVal === "object" && !Array.isArray(firstVal);
+
+            if (isNested) {
+              globalFields.forEach((fieldName) => {
+                const valueData = fieldRawData[fieldName];
+                if (valueData) {
+                  const [value, columnType] = valueData;
+                  if (value) {
+                    hasGlobalExtra = true;
+                    globalExtraContent += `<div class="flex justify-between space-x-2">
+                      <span class="font-medium">${echartsEncode(fieldName)}</span>
+                      <span>${echartsEncode(formatValue(value, columnType, true))}</span>
+                    </div>`;
+                  }
+                }
+              });
+            } else {
+              Object.entries(extraData).forEach(([key, valueData]) => {
+                if (Array.isArray(valueData) && valueData.length >= 2) {
+                  const [value, columnType] = valueData;
+                  if (value) {
+                    hasGlobalExtra = true;
+                    globalExtraContent += `<div class="flex justify-between space-x-2">
+                      <span class="font-medium">${echartsEncode(key)}</span>
+                      <span>${echartsEncode(formatValue(value, columnType, true))}</span>
+                    </div>`;
+                  }
+                }
+              });
+            }
+          }
+
+          if (hasGlobalExtra) {
+            tooltipContent += `<div class="mt-2">${globalExtraContent}</div>`;
+          }
+
+          // Use a Set to track shown categories
+          tooltipContent += "<div class=\"mt-2\">";
+          params.forEach((param: any) => {
+            if (param.axisDim !== indexDim) {
+              return; // Skip non-index axis items
+            }
+            let value: number;
+            if (isContinuousData && layout === "horizontal" && Array.isArray(param.value) && param.value.length >= 2) {
+              value = param.value[1] as number;
+            } else {
+              value = param.value as number;
+            }
+
+            // Skip categories with missing or null values
+            if (value === null || value === undefined || isNaN(value)) {
+              return;
+            }
+
+            const formattedValue = valueFormatter(value);
+            tooltipContent += `<div class="flex items-center justify-between space-x-2">
+              <div class="flex items-center space-x-2">
+                <span class="inline-block size-2 rounded-sm" style="background-color: ${safeColor(param.color)}"></span>
+                ${(showLegend || cleanCategories.length > 1) ? `<span>${echartsEncode(param.seriesName)}</span>` : ""}
+              </div>
+              <span class="font-medium">${echartsEncode(formattedValue)}</span>
+            </div>`;
+
+            const catExtraData = getExtraDataForCategory(param.seriesName);
+            if (catExtraData) {
+              Object.entries(catExtraData).forEach(([key, valueData]) => {
+                if (globalFields.has(key)) {
+                  return;
+                }
+                if (Array.isArray(valueData) && valueData.length >= 2) {
+                  const [value, columnType] = valueData;
+                  if (!value) {
+                    return;
+                  }
+                  tooltipContent += `<div class="flex items-center justify-between space-x-2 pl-4 text-xs text-muted-foreground opacity-80 mt-0.5">
+                    <span>${echartsEncode(key)}</span>
+                    <span class="font-medium">${echartsEncode(formatValue(value, columnType, true))}</span>
+                  </div>`;
+                }
+              });
+            }
+          });
+          tooltipContent += "</div>";
+
+          return tooltipContent;
+        },
+      },
+      legend: {
+        show: !isEmpty && showLegend,
+        selectedMode: false,
+        type: canFitLegendItems ? "plain" : "scroll",
+        orient: "horizontal",
+        left: chartPadding,
+        top: 7 + labelTopOffset + chartPadding,
+        padding: [5, canFitLegendItems ? legendPaddingRight : 25, 5, legendPaddingLeft],
+        textStyle: {
+          color: textColor,
+          fontFamily: chartFont,
+          fontWeight: 500,
+          width: canFitLegendItems ? legendItemWidth : undefined,
+          overflow: "truncate",
+        },
+        itemGap: legendItemGap,
+        itemHeight: 10,
+        itemWidth: 10,
+        pageButtonPosition: "end",
+        pageButtonGap: 10,
+        pageButtonItemGap: 5,
+        pageIconColor: textColorSecondary,
+        pageIconInactiveColor: borderColor,
+        pageIcons: {
+          horizontal: [
+            "M10.8284 12.0007L15.7782 16.9504L14.364 18.3646L8 12.0007L14.364 5.63672L15.7782 7.05093L10.8284 12.0007Z",
+            "M13.1717 12.0007L8.22192 7.05093L9.63614 5.63672L16.0001 12.0007L9.63614 18.3646L8.22192 16.9504L13.1717 12.0007Z",
+          ],
+        },
+        pageIconSize: 12,
+        pageFormatter: () => "",
+        pageTextStyle: {
+          fontSize: 1,
+        },
+      },
+      grid: {
+        left: (cleanYAxisLabel ? 45 : 15) + chartPadding,
+        right: 16 + chartPadding + (cleanYAxisLabel ? 20 : 0),
+        top: 10 + legendTopOffset + labelTopOffset + chartPadding,
+        bottom: (cleanXAxisLabel ? 32 : 8) + chartPadding,
+        outerBoundsMode: "same",
+        outerBoundsContain: "axisLabel",
+      },
+      xAxis: {
+        type: isEmpty
+          ? (layout === "vertical" ? ("value" as const) : ("category" as const))
+          : layout === "vertical"
+            ? ("value" as const)
+            : (isTimestampData ? ("time" as const) : isNumericData ? ("value" as const) : ("category" as const)),
+        data: isEmpty ? (layout === "vertical" ? undefined : ["", "", "", "", ""]) : xData,
+        min: isEmpty && layout === "vertical" ? 0 : undefined,
+        max: isEmpty && layout === "vertical" ? 4 : undefined,
+        interval: isEmpty && layout === "vertical" ? 1 : undefined,
+        show: true,
+        scale: !isEmpty && layout === "horizontal" && isNumericData ? true : undefined,
+        axisLabel: {
+          show: true,
+          customValues,
+          showMinLabel: true,
+          showMaxLabel: true,
+          formatter: (value: any) => {
+            if (isEmpty) {
+              return layout === "vertical" ? "000" : " ";
+            }
+            if (layout === "horizontal") {
+              return toSingleLine(indexFormatter(indexType === "duration" || indexType === "time" ? new Date(value).getTime() : value, shortenLabel));
+            }
+            return toSingleLine(valueFormatter(value, true));
+          },
+          color: isEmpty ? "transparent" : textColorSecondary,
+          fontFamily: chartFont,
+          fontSize: 12,
+          interval: xData && !shouldRotateXLabel ? Math.floor((maxLabelLen / 13) * xData.length / (chartWidth / 80)) : undefined,
+          rotate: shouldRotateXLabel ? 45 : 0,
+          hideOverlap: true,
+          padding: [4, 8, 4, 8],
+        },
+        axisPointer: {
+          type: "line",
+          show: !isEmpty && (layout === "horizontal" || dataCopy.length > 1),
+          triggerEmphasis: layout === "horizontal",
+          triggerOn: "mousemove",
+          triggerTooltip: layout === "horizontal",
+          lineStyle: {
+            color: referenceLineColor,
+            type: "solid",
+            width: 0.65,
+          },
+          label: {
+            show: !isEmpty && data.length > 1,
+            formatter: (params: any) => {
+              if (layout === "horizontal") {
+                return toSingleLine(indexFormatter(indexType === "number" && params.value > 1 ? Math.round(params.value) : indexType === "duration" || indexType === "time" ? new Date(params.value).getTime() : params.value, xSpace / 5.8));
+              }
+              return toSingleLine(valueFormatter(valueType === "number" && params.value > 1 ? Math.round(params.value) : params.value, true));
+            },
+            fontFamily: chartFont,
+            margin: 5,
+            color: textColorInverted,
+            backgroundColor: backgroundColorInverted,
+          },
+        },
+        axisLine: {
+          show: false,
+        },
+        axisTick: {
+          show: false,
+          customValues,
+        },
+        splitLine: {
+          show: layout === "vertical" ? (isEmpty || dataCopy.length > 1) : false,
+          lineStyle: {
+            color: borderColor,
+          },
+        },
+        name: cleanXAxisLabel,
+        nameLocation: "middle",
+        nameGap: 36,
+        nameTextStyle: {
+          color: textColor,
+          fontFamily: chartFont,
+          fontWeight: 500,
+          fontSize: 12,
+        },
+      },
+      yAxis: {
+        type: isEmpty
+          ? (layout === "horizontal" ? ("value" as const) : ("category" as const))
+          : layout === "horizontal"
+            ? ("value" as const)
+            : ("category" as const),
+        data: isEmpty ? (layout === "vertical" ? ["", "", "", "", ""] : undefined) : (layout === "vertical" ? dataCopy.map((item) => item[index]) : undefined),
+        min: isEmpty && layout === "horizontal" ? 0 : undefined,
+        max: isEmpty && layout === "horizontal" ? 4 : undefined,
+        interval: isEmpty && layout === "horizontal" ? 1 : undefined,
+        show: true,
+        axisLabel: {
+          show: true,
+          formatter: (value: any) => {
+            if (isEmpty) {
+              return layout === "horizontal" ? "000" : " ";
+            }
+            if (layout === "horizontal") {
+              return toSingleLine(valueFormatter(value, true));
+            }
+            return toSingleLine(indexFormatter(indexType === "duration" || indexType === "time" ? new Date(value).getTime() : value, xSpace / 30));
+          },
+          color: isEmpty ? "transparent" : textColorSecondary,
+          fontFamily: chartFont,
+          fontSize: 12,
+          showMinLabel: true,
+          showMaxLabel: true,
+          padding: [4, 8, 4, 8], // Add padding around labels
+          hideOverlap: true,
+        },
+        axisPointer: {
+          type: "line",
+          show: !isEmpty && (layout === "vertical" || dataCopy.length > 1),
+          triggerEmphasis: layout === "vertical",
+          triggerOn: "mousemove",
+          lineStyle: {
+            color: referenceLineColor,
+            type: "solid",
+            width: 0.65,
+          },
+          label: {
+            show: !isEmpty && (layout === "horizontal" || dataCopy.length > 1),
+            formatter: (params: any) => {
+              if (layout === "horizontal") {
+                return toSingleLine(valueFormatter(valueType === "number" && params.value > 1 ? Math.round(params.value) : params.value));
+              }
+              return toSingleLine(indexFormatter(indexType === "number" && params.value > 1 ? Math.round(params.value) : indexType === "duration" || indexType === "time" ? new Date(params.value).getTime() : params.value, xSpace / 5.8));
+            },
+            fontFamily: chartFont,
+            margin: 10,
+            color: textColorInverted,
+            backgroundColor: backgroundColorInverted,
+          },
+        },
+        axisLine: {
+          show: false,
+        },
+        axisTick: {
+          show: false,
+        },
+        splitLine: {
+          show: layout === "horizontal" ? (isEmpty || dataCopy.length > 1) : false,
+          lineStyle: {
+            color: borderColor,
+          },
+        },
+      },
+      series: isEmpty ? [] : series,
+      // We use a graphic element to display the y-axis label instead of the axis name
+      // since the name can overlap with the axis labels.
+      // See https://github.com/apache/echarts/issues/12415#issuecomment-2285226567
+      graphic: {
+        type: "text",
+        rotation: Math.PI / 2,
+        y: (chartHeight + labelTopOffset + legendTopOffset - spaceForXaxisLabel) / 2,
+        x: 5 + chartPadding,
+        cursor: "default",
+        style: {
+          text: cleanYAxisLabel,
+          font: `500 12px ${chartFont}`,
+          fill: textColor,
+          width: chartHeight,
+          textAlign: "center",
+        },
+      },
+    };
+  }, [
+    data,
+    categories,
+    colorsByCategory,
+    index,
+    indexType,
+    valueType,
+    valueFormatter,
+    indexFormatter,
+    showLegend,
+    layout,
+    type,
+    xAxisLabel,
+    yAxisLabel,
+    extraDataByIndexAxis,
+    isDarkMode,
+    chartWidth,
+    chartHeight,
+    label,
+    subtitle,
+    markLines,
+    chartId,
+  ]);
+
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart || data.length === 0) {
+      return;
+    }
+    const { referenceLineColor } = getThemeColors(isDarkMode, chartId);
+    const isTimestampData = isDatableType(indexType);
+    const series: BarSeriesOption[] = [{
+      id: "shaper-hover-reference-line",
+      type: "bar" as const,
+      stack: type === "stacked" ? "stack" : categories[0],
+      markLine: {
+        silent: true,
+        symbol: "none",
+        animation: false,
+        label: {
+          show: false,
+        },
+        lineStyle: {
+          color: referenceLineColor,
+          type: "solid",
+          width: 0.65,
+        },
+        data: isHovering != null && (data.length !== 1 || data[0][index] === isHovering) ? [{
+          [layout === "horizontal" ? "xAxis" : "yAxis"]: isTimestampData && layout === "vertical"
+            ? new Date(isHovering).toISOString()
+            : isHovering,
+        }] : [],
+      },
+    }];
+    chart.setOption({ series }, { lazyUpdate: true });
+  }, [
+    data,
+    index,
+    categories,
+    indexType,
+    isDarkMode,
+    layout,
+    type,
+    isHovering,
+    chartId,
+  ]);
+
+  // Event handlers for the EChart component
+  const chartEvents = React.useMemo(() => {
+    return {
+      // Add tooltip event handler
+      showTip: (params: any) => {
+        let dataIndex = -1;
+        let indexValue: any;
+
+        if (layout === "vertical") {
+          // Safely access nested properties for vertical layout
+          const dataByCoordSys = Array.isArray(params?.dataByCoordSys) && params.dataByCoordSys.length > 0
+            ? params.dataByCoordSys[0]
+            : undefined;
+          if (dataByCoordSys?.dataByAxis) {
+            const yAxisData = dataByCoordSys.dataByAxis.find((item: any) => item?.axisDim === "y");
+            if (yAxisData?.value !== undefined) {
+              dataIndex = yAxisData.value;
+            }
+          }
+        } else {
+          // For horizontal layout, use standard params
+          if (params?.dataIndex !== undefined && params?.seriesIndex !== undefined) {
+            dataIndex = params.dataIndex;
+          } else if (params?.axisValue !== undefined) {
+            indexValue = params.axisValue;
+          }
+        }
+
+        // Only try to get indexValue from data if we have a valid dataIndex
+        if (dataIndex >= 0 && dataIndex < data.length) {
+          const item = data[dataIndex];
+          if (item && index in item) {
+            indexValue = item[index];
+          }
+        }
+
+        if (indexValue !== undefined) {
+          setHoverState(indexValue, chartId, indexType);
+        }
+      },
+      // Also handle tooltip hide to clear hover state
+      hideTip: () => {
+        // Always clear hover state when tooltip is hidden
+        if (hoveredChartIdRef.current === chartId) {
+          setHoverState(null, null, null);
+        }
+      },
+    };
+  }, [data, index, chartId, setHoverState, indexType, layout]);
+
+  // Handle chart instance reference
+  const handleChartReady = useCallback((chart: ECharts) => {
+    chartRef.current = chart;
+    setChartWidth(chart.getWidth());
+    setChartHeight(chart.getHeight());
+  }, []);
+
+  const handleChartResize = useCallback((chart: ECharts) => {
+    setChartWidth(chart.getWidth());
+    setChartHeight(chart.getHeight());
+  }, []);
+
+  return (
+    <div
+      className={cx("h-full w-full relative select-none overflow-hidden", className)}
+      {...other}
+    >
+      <EChart
+        className="relative h-full w-full"
+        option={chartOptions}
+        events={chartEvents}
+        onChartReady={handleChartReady}
+        onResize={handleChartResize}
+        data-chart-id={chartId}
+      />
+    </div>
+  );
+};
+
+BarChart.displayName = "BarChart";
+
+export { BarChart, type BarChartProps };

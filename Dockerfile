@@ -1,0 +1,85 @@
+# SPDX-License-Identifier: MPL-2.0
+
+# Using slim instead of a from scratch image because:
+# 1. We are dynamically linking DuckDB since some extensions have issues with static linking
+# 2. Having a shell is useful for debugging
+# Using Debian over Alpine since Debian uses glibc and DuckDB has issues with musl.
+# Keep in sync with .github/workflows/ci.yml
+FROM debian:13.7-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f
+
+# install dependencies for headless-shell and gosu for stepping down from root, as well as wget.
+# Note on vulnerability management and base packages:
+# - wget: Previously used for healthchecks (now handled by `shaper healthcheck`).
+#   We keep wget in the image to avoid breaking downstream images or user workflows that rely on it.
+# - glibc (libc6) is required by the dynamically linked shaper/DuckDB binary and headless-shell.
+# - libsqlite3-0 is required by headless-shell: libnss3 (libsoftokn3) links against it for certificate/key DBs;
+#   removing it causes headless-shell to crash fatally on launch (nss_error=-5925).
+# - perl-base and gzip are Debian essentials (Essential: yes). While scanners may flag unfixable CVEs in them,
+#   they are not invoked by shaper or headless-shell, posing no practical attack surface. We deliberately keep them
+#   so downstream images built on top of this one can safely run `apt-get install` without breaking debconf/dpkg.
+RUN export DEBIAN_FRONTEND=noninteractive \
+  && apt-get update \
+  && apt-get upgrade -y \
+  && apt-get install --no-install-recommends -y \
+    ca-certificates \
+    gosu \
+    libexpat1 \
+    libfontconfig1 \
+    libnspr4 \
+    libnss3 \
+    libuuid1 \
+    socat \
+    wget \
+  && apt-get clean \
+  && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* /tmp/* /var/tmp/*
+
+# Get headless-shell (a minimal Chromium build)
+# It is also built on Debian slim so should be compatible
+COPY --from=chromedp/headless-shell:151.0.7922.109@sha256:2d349b544a1ea6b5b5fd7c0fe99215ff662339c57407ee2e8c0a11af93516b04 /headless-shell /headless-shell
+
+LABEL maintainer="hi@taleshape.com"
+
+ARG BUILD_DATE
+ARG VERSION
+LABEL org.opencontainers.image.authors="Taleshape OÜ"
+LABEL org.opencontainers.image.created="${BUILD_DATE}"
+LABEL org.opencontainers.image.url="https://hub.docker.com/r/taleshape/shaper"
+LABEL org.opencontainers.image.documentation="https://taleshape.com/shaper"
+LABEL org.opencontainers.image.version="${VERSION}"
+LABEL org.opencontainers.image.vendor="Taleshape"
+LABEL org.opencontainers.image.source="https://github.com/taleshape-com/shaper"
+
+ARG TARGETARCH
+
+# 2 vars for headless-shell
+ENV LANG=en-US.UTF-8
+ENV PATH=/headless-shell:$PATH
+# When running in a container, listen on all interfaces (including IPv6) by default
+ENV SHAPER_ADDR=:5454
+# Override default data directory with something easy to mount to
+ENV SHAPER_DIR=/data
+# Override default DuckDB extension directory to persist downloaded extensions together with data
+ENV SHAPER_DUCKDB_EXT_DIR=/data/duckdb_extensions
+ENV SHAPER_INIT_SQL_FILE=/var/lib/shaper/init.sql
+# Disable Chrome sandbox. As non-root user we don't have the permissions to sandbox and the docker container already is our sandbox.
+ENV SHAPER_NO_CHROME_SANDBOX=true
+# Disable automatically opening URLs in browser for CLI commands since this won't work in Docker.
+ENV SHAPER_NO_OPEN=true
+
+EXPOSE 5454
+HEALTHCHECK --interval=5s --timeout=3s --retries=3 --start-period=60s CMD ["/usr/local/bin/shaper", "healthcheck"]
+
+# Create a non-root user and setup directories
+RUN groupadd -r shaper && useradd -r -g shaper shaper \
+  && mkdir -p /data /var/lib/shaper \
+  && chown -R shaper:shaper /data /var/lib/shaper
+
+# Copy the correct binary based on architecture
+COPY bin/shaper-linux-${TARGETARCH} /usr/local/bin/shaper
+
+# Copy and setup entrypoint
+COPY docker-entrypoint.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
+
+ENTRYPOINT ["docker-entrypoint.sh"]
+CMD ["/usr/local/bin/shaper"]

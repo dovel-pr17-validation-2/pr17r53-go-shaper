@@ -1,0 +1,869 @@
+// SPDX-License-Identifier: MPL-2.0
+
+import React, { useEffect, useCallback, useRef } from "react";
+import type { ECharts } from "echarts/core";
+import type { LineSeriesOption } from "echarts/charts";
+import {
+  constructCategoryColors,
+  getThemeColors,
+  getChartFont,
+  getDisplayFont,
+  toSingleLine,
+} from "../../lib/chartUtils";
+import { cx, getNameIfSet } from "../../lib/utils";
+import { ChartHoverContext } from "../../contexts/ChartHoverContext";
+import { DarkModeContext } from "../../contexts/DarkModeContext";
+import { Column, isDatableType, MarkLine } from "../../lib/types";
+import { formatValue, echartsEncode } from "../../lib/render";
+import { safeColor } from "../../lib/safeColor";
+import { EChart } from "./EChart";
+
+interface LineChartProps extends React.HTMLAttributes<HTMLDivElement> {
+  chartId: string;
+  label?: string;
+  subtitle?: string;
+  data: Record<string, any>[];
+  extraDataByIndexAxis: Record<string, Record<string, any>>;
+  index: string;
+  indexType: Column["type"];
+  valueType: Column["type"];
+  categories: string[];
+  colorsByCategory: Record<string, string>;
+  valueFormatter: (value: number, shortFormat?: boolean | number) => string;
+  indexFormatter: (value: number | string, shortFormat?: boolean | number) => string;
+  showLegend?: boolean;
+  xAxisLabel?: string;
+  yAxisLabel?: string;
+  markLines?: MarkLine[];
+  bandLowerName?: string;
+  bandUpperName?: string;
+}
+
+const chartPadding = 16;
+
+const getBandColor = (color: string, isDarkMode: boolean): string => {
+  const opacity = isDarkMode ? 0.40 : 0.25;
+  if (!color) return `rgba(0, 0, 0, ${opacity})`;
+  const trimmed = color.trim();
+  if (trimmed.startsWith("#")) {
+    if (trimmed.length === 7) {
+      return `rgba(${parseInt(trimmed.slice(1, 3), 16)}, ${parseInt(trimmed.slice(3, 5), 16)}, ${parseInt(trimmed.slice(5, 7), 16)}, ${opacity})`;
+    } else if (trimmed.length === 4) {
+      const r = parseInt(trimmed[1] + trimmed[1], 16);
+      const g = parseInt(trimmed[2] + trimmed[2], 16);
+      const b = parseInt(trimmed[3] + trimmed[3], 16);
+      return `rgba(${r}, ${g}, ${b}, ${opacity})`;
+    }
+  }
+  return `color-mix(in srgb, ${trimmed} ${opacity * 100}%, transparent)`;
+};
+
+const LineChart = (props: LineChartProps) => {
+  const {
+    data,
+    extraDataByIndexAxis,
+    categories,
+    colorsByCategory,
+    index,
+    indexType,
+    valueType,
+    valueFormatter,
+    indexFormatter,
+    showLegend = true,
+    className,
+    xAxisLabel,
+    yAxisLabel,
+    chartId,
+    label,
+    subtitle,
+    markLines,
+    bandLowerName,
+    bandUpperName,
+    ...other
+  } = props;
+
+  const chartRef = useRef<ECharts | null>(null);
+  const [chartWidth, setChartWidth] = React.useState(450);
+  const [chartHeight, setChartHeight] = React.useState(300);
+  const hoveredChartIdRef = useRef<string | null>(null);
+
+  const { hoveredIndex, hoveredChartId, hoveredIndexType, setHoverState } =
+    React.useContext(ChartHoverContext);
+
+  const { isDarkMode } = React.useContext(DarkModeContext);
+  const isHovering = React.useMemo(() => {
+    if (hoveredIndex != null && hoveredIndexType === indexType && hoveredChartId != null && hoveredChartId !== chartId) {
+      return hoveredIndex;
+    }
+    return null;
+  }, [hoveredIndex, hoveredIndexType, indexType, hoveredChartId, chartId]);
+
+  // Update hoveredChartId ref whenever it changes
+  useEffect(() => {
+    hoveredChartIdRef.current = hoveredChartId;
+  }, [hoveredChartId]);
+
+  const dataByIndex = React.useMemo(() => {
+    const map: Record<string | number, any> = {};
+    data.forEach((item) => {
+      map[item[index]] = item;
+    });
+    return map;
+  }, [data, index]);
+
+  // Memoize the chart options to prevent unnecessary re-renders
+  const chartOptions = React.useMemo(() => {
+    // Get computed colors for theme
+    const { borderColor, textColor, textColorSecondary, referenceLineColor, backgroundColorSecondary, textColorInverted, backgroundColorInverted } = getThemeColors(isDarkMode, chartId);
+    const chartFont = getChartFont(chartId);
+    const displayFont = getDisplayFont(chartId);
+    const cleanXAxisLabel = toSingleLine(xAxisLabel);
+    const cleanYAxisLabel = toSingleLine(yAxisLabel);
+    const cleanCategories = categories.map(toSingleLine);
+    const categoryColors = constructCategoryColors(cleanCategories, colorsByCategory, isDarkMode, chartId);
+
+    const isTimestampData = isDatableType(indexType);
+    const isNumericData = indexType === "number" || indexType === "percent";
+    const isContinuousData = isTimestampData || isNumericData;
+    // show dots when there are not too many data points per category
+    const showDots = data.length / chartWidth / cleanCategories.length > 0.02;
+
+    const hasBand = (category: string, origCategory: string) => {
+      return data.some(item => (
+        (item[category + "_band_lower"] !== undefined && item[category + "_band_lower"] !== null && item[category + "_band_lower"] !== "") ||
+        (item[origCategory + "_band_lower"] !== undefined && item[origCategory + "_band_lower"] !== null && item[origCategory + "_band_lower"] !== "")
+      ));
+    };
+
+    // Set up chart options
+    const series: LineSeriesOption[] = [];
+    cleanCategories.forEach((category, catIndex) => {
+      const origCategory = categories[catIndex] ?? category;
+      const col = categoryColors.get(category) || "#333";
+      series.push({
+        name: category,
+        id: category,
+        type: "line" as const,
+        data: isContinuousData
+          ? data.map((item) => {
+            const sc = safeColor(item._color);
+            const val = item[category] ?? item[origCategory];
+            return sc && val != null
+              ? { value: [item[index], val], itemStyle: { color: sc } }
+              : [item[index], val];
+          })
+          : data.map((item) => {
+            const sc = safeColor(item._color);
+            const val = item[category] ?? item[origCategory];
+            return sc && val != null
+              ? { value: val, itemStyle: { color: sc } }
+              : val;
+          }),
+        connectNulls: true,
+        symbol: "circle",
+        symbolSize: data.length > 1 ? 8 : 10,
+        cursor: "crosshair",
+        zlevel: 10,
+        emphasis: {
+          scale: 1.3,
+          focus: "self",
+        },
+        animationDelay: 100,
+        animationDelayUpdate: 100,
+        lineStyle: {
+          color: col,
+          width: 2,
+        },
+        itemStyle: {
+          color: col,
+          borderWidth: 0,
+          opacity: showDots ? 0 : 1,
+        },
+      });
+
+      if (hasBand(category, origCategory)) {
+        series.push({
+          name: category + "_band_lower",
+          id: category + "_band_lower",
+          type: "line" as const,
+          data: isContinuousData
+            ? data.map((item) => [item[index], item[category + "_band_lower"] ?? item[origCategory + "_band_lower"]])
+            : data.map((item) => item[category + "_band_lower"] ?? item[origCategory + "_band_lower"]),
+          lineStyle: {
+            opacity: 0,
+          },
+          stack: "band_" + category,
+          symbol: "none",
+          connectNulls: true,
+        });
+
+        series.push({
+          name: category + "_band_upper",
+          id: category + "_band_upper",
+          type: "line" as const,
+          data: isContinuousData
+            ? data.map((item) => {
+              const rawLower = item[category + "_band_lower"] ?? item[origCategory + "_band_lower"];
+              const rawUpper = item[category + "_band_upper"] ?? item[origCategory + "_band_upper"];
+              const lower = rawLower !== null && rawLower !== undefined && rawLower !== "" ? Number(rawLower) : null;
+              const upper = rawUpper !== null && rawUpper !== undefined && rawUpper !== "" ? Number(rawUpper) : null;
+              return [item[index], (lower !== null && upper !== null && !isNaN(lower) && !isNaN(upper)) ? upper - lower : null];
+            })
+            : data.map((item) => {
+              const rawLower = item[category + "_band_lower"] ?? item[origCategory + "_band_lower"];
+              const rawUpper = item[category + "_band_upper"] ?? item[origCategory + "_band_upper"];
+              const lower = rawLower !== null && rawLower !== undefined && rawLower !== "" ? Number(rawLower) : null;
+              const upper = rawUpper !== null && rawUpper !== undefined && rawUpper !== "" ? Number(rawUpper) : null;
+              return (lower !== null && upper !== null && !isNaN(lower) && !isNaN(upper)) ? upper - lower : null;
+            }),
+          lineStyle: {
+            opacity: 0,
+          },
+          areaStyle: {
+            color: getBandColor(col, isDarkMode),
+          },
+          stack: "band_" + category,
+          symbol: "none",
+          connectNulls: true,
+        });
+      }
+    });
+
+    if (markLines) {
+      let foundEventLine = false;
+      let multiEventLines = false;
+      for (const m of markLines) {
+        if (!m.isYAxis) {
+          if (foundEventLine) {
+            multiEventLines = true;
+            break;
+          }
+          foundEventLine = true;
+        }
+      }
+      series.push({
+        type: "line" as const,
+        markLine: {
+          silent: true,
+          animation: false,
+          symbol: "none",
+          data: markLines.map(m => {
+            return {
+              xAxis: m.isYAxis ? undefined : m.value,
+              yAxis: m.isYAxis ? m.value : undefined,
+              symbol: m.isYAxis ? "none" : "circle",
+              symbolSize: 6.5,
+              lineStyle: {
+                color: textColorSecondary,
+                type: "dashed",
+                width: m.isYAxis ? 1.2 : 1.0,
+                opacity: m.isYAxis ? 0.5 : 0.8,
+              },
+              label: {
+                formatter: m.label,
+                position: m.isYAxis ? "insideStartTop" : multiEventLines ? "insideEnd" : "end",
+                distance: m.isYAxis ? 1.5 : multiEventLines ? 5 : 3.8,
+                color: textColorSecondary,
+                fontFamily: chartFont,
+                fontWeight: 500,
+                fontSize: 11,
+                opacity: m.isYAxis ? 0.5 : 0.8,
+                width: m.isYAxis ? chartWidth / 3 : chartHeight / 2,
+                overflow: "truncate",
+                textBorderColor: backgroundColorSecondary,
+                textBorderWidth: !m.isYAxis && multiEventLines ? 2 : 0,
+              },
+            };
+          }),
+        },
+      });
+    }
+
+    const numLegendItems = cleanCategories.filter(c => c.length > 0).length;
+    const avgLegendCharCount = numLegendItems > 0 ? cleanCategories.reduce((acc, c) => acc + c.length, 0) / numLegendItems : 0;
+    const minLegendItemWidth = Math.max(avgLegendCharCount * 8, 50);
+    const legendPaddingLeft = 5;
+    const legendPaddingRight = 5;
+    const legendItemGap = 10;
+    const legendWidth = chartWidth - legendPaddingLeft - legendPaddingRight;
+    const halfLegendItems = Math.max(1, Math.ceil(numLegendItems / 2));
+    const legendItemWidth = numLegendItems <= 1
+      ? legendWidth
+      : (legendWidth - (legendItemGap * (halfLegendItems - 1))) / halfLegendItems;
+    const canFitLegendItems = legendItemWidth >= minLegendItemWidth;
+    const legendTopOffset = (showLegend ? (numLegendItems === 0 || legendWidth / numLegendItems >= minLegendItemWidth ? 40 : 58) : 0);
+    let labelTopOffset = label ? 40 + 15 * (Math.ceil(label.length / (0.125 * chartWidth)) - 1) : 10;
+    if (subtitle) {
+      const subtitleLines = Math.max(1, Math.ceil(subtitle.length / (0.15 * chartWidth)));
+      if (label) {
+        labelTopOffset += 4 + subtitleLines * 16;
+      } else {
+        labelTopOffset = 25 + subtitleLines * 16;
+      }
+    }
+    const spaceForXaxisLabel = 10 + (cleanXAxisLabel ? 25 : 0);
+    const xData = !isContinuousData ? data.map((item) => item[index]) : undefined;
+    const rawCustomValues = isContinuousData
+      ? Array.from(new Set(data.map((item) => item[index]).filter((val) => val != null))).sort((a, b) => {
+        const numA = typeof a === "number" ? a : new Date(a).getTime();
+        const numB = typeof b === "number" ? b : new Date(b).getTime();
+        return numA - numB;
+      })
+      : undefined;
+    const xValues = isContinuousData ? rawCustomValues : xData;
+    const xSpace = (chartWidth - 2 * chartPadding + (cleanYAxisLabel ? 50 : 30));
+    const shortenLabel = xValues && xValues.length > 0 ? (xSpace / xValues.length) * (0.10 + (0.00004 * xSpace)) : true;
+
+    let maxLabelLen = 0;
+    (xValues ?? []).forEach(x => {
+      const v = indexFormatter(indexType === "duration" || indexType === "time" ? new Date(x).getTime() : x, shortenLabel);
+      if (v.length > maxLabelLen) {
+        maxLabelLen = v.length;
+      }
+    });
+    const hasManyLabels = typeof shortenLabel === "number" && shortenLabel <= 12;
+    const shouldRotateXLabel = !isContinuousData && !cleanXAxisLabel && hasManyLabels;
+    const isEmpty = data.length === 0;
+    const customValues = hasManyLabels || isEmpty ? undefined : rawCustomValues;
+
+    return {
+      title: {
+        text: label,
+        textStyle: {
+          fontSize: 15,
+          lineHeight: 15,
+          fontFamily: displayFont,
+          fontWeight: 600,
+          color: textColor,
+          width: chartWidth - 10 - 2 * chartPadding,
+          overflow: "break",
+        },
+        subtext: subtitle,
+        subtextStyle: {
+          fontSize: 12,
+          lineHeight: 14,
+          fontFamily: chartFont,
+          color: textColorSecondary,
+          width: chartWidth - 10 - 2 * chartPadding,
+          overflow: "break",
+        },
+        itemGap: 4,
+        left: chartPadding,
+        top: chartPadding,
+      },
+      tooltip: {
+        show: !isEmpty,
+        trigger: "axis",
+        triggerOn: "mousemove",
+        enterable: false,
+        confine: true,
+        hideDelay: 200, // Increase hide delay to prevent flickering
+        showDelay: 0, // Show immediately
+        borderRadius: 5,
+        borderWidth: 0,
+        backgroundColor: backgroundColorSecondary,
+        textStyle: {
+          fontFamily: chartFont,
+          color: textColor,
+        },
+        formatter: (params: any) => {
+          let indexValue: any;
+
+          const axisData = params.find((item: any) => item?.axisDim === "x");
+          if (isContinuousData) {
+            indexValue = axisData.value[0]; // timestamp is the first element
+          } else {
+            indexValue = axisData.axisValue;
+          }
+          const extraData = extraDataByIndexAxis[indexValue];
+
+          const getExtraDataForCategory = (categoryName: string) => {
+            if (!extraData) return null;
+            const firstVal = Object.values(extraData)[0];
+            if (firstVal && typeof firstVal === "object" && !Array.isArray(firstVal)) {
+              return extraData[categoryName] ?? extraData[categories[cleanCategories.indexOf(categoryName)]];
+            }
+            if (categoryName === "" || cleanCategories.length <= 1) {
+              return extraData;
+            }
+            return null;
+          };
+
+          const globalFields = new Set<string>();
+          const fieldValuesAcrossCategories: Record<string, string[]> = {};
+          const fieldRawData: Record<string, [any, Column["type"]]> = {};
+
+          if (extraData) {
+            const firstVal = Object.values(extraData)[0];
+            const isNested = firstVal && typeof firstVal === "object" && !Array.isArray(firstVal);
+
+            if (isNested) {
+              Object.values(extraData).forEach((fieldsObj) => {
+                if (fieldsObj && typeof fieldsObj === "object") {
+                  Object.entries(fieldsObj).forEach(([fieldName, valueData]) => {
+                    if (Array.isArray(valueData) && valueData.length >= 2) {
+                      const [value, columnType] = valueData;
+                      const formatted = formatValue(value, columnType, true).toString();
+                      if (!fieldValuesAcrossCategories[fieldName]) {
+                        fieldValuesAcrossCategories[fieldName] = [];
+                        fieldRawData[fieldName] = valueData as [any, Column["type"]];
+                      }
+                      fieldValuesAcrossCategories[fieldName].push(formatted);
+                    }
+                  });
+                }
+              });
+
+              const totalCategoriesWithExtra = Object.keys(extraData).filter(c => c !== "").length;
+              Object.entries(fieldValuesAcrossCategories).forEach(([fieldName, list]) => {
+                const allSame = list.every(val => val === list[0]);
+                const isGlobal = allSame && (totalCategoriesWithExtra <= 1 || list.length === totalCategoriesWithExtra);
+                if (isGlobal) {
+                  globalFields.add(fieldName);
+                }
+              });
+            }
+          }
+
+          const formattedIndex = indexFormatter(indexType === "duration" ? new Date(indexValue).getTime() : indexValue, xSpace / 6.5);
+          let tooltipContent = `<div class="text-sm font-medium">${echartsEncode(formattedIndex)}</div>`;
+
+          let hasGlobalExtra = false;
+          let globalExtraContent = "";
+          if (extraData) {
+            const firstVal = Object.values(extraData)[0];
+            const isNested = firstVal && typeof firstVal === "object" && !Array.isArray(firstVal);
+
+            if (isNested) {
+              globalFields.forEach((fieldName) => {
+                const valueData = fieldRawData[fieldName];
+                if (valueData) {
+                  const [value, columnType] = valueData;
+                  if (value) {
+                    hasGlobalExtra = true;
+                    globalExtraContent += `<div class="flex justify-between space-x-2">
+                      <span class="font-medium">${echartsEncode(fieldName)}</span>
+                      <span>${echartsEncode(formatValue(value, columnType, true))}</span>
+                    </div>`;
+                  }
+                }
+              });
+            } else {
+              Object.entries(extraData).forEach(([key, valueData]) => {
+                if (Array.isArray(valueData) && valueData.length >= 2) {
+                  const [value, columnType] = valueData;
+                  if (value) {
+                    hasGlobalExtra = true;
+                    globalExtraContent += `<div class="flex justify-between space-x-2">
+                      <span class="font-medium">${echartsEncode(key)}</span>
+                      <span>${echartsEncode(formatValue(value, columnType, true))}</span>
+                    </div>`;
+                  }
+                }
+              });
+            }
+          }
+
+          if (hasGlobalExtra) {
+            tooltipContent += `<div class="mt-2">${globalExtraContent}</div>`;
+          }
+
+          // Use a Set to track shown categories
+          tooltipContent += "<div class=\"mt-2\">";
+          params.forEach((param: any) => {
+            if (param.axisDim !== "x") {
+              return; // Skip non-index axis items
+            }
+
+            if (param.seriesName.endsWith("_band_lower") || param.seriesName.endsWith("_band_upper")) {
+              return; // Skip band series
+            }
+
+            let value: number;
+            if (isContinuousData && Array.isArray(param.value) && param.value.length >= 2) {
+              value = param.value[1] as number;
+            } else {
+              value = param.value as number;
+            }
+
+            // Skip categories with missing or null values
+            if (value === null || value === undefined || isNaN(value)) {
+              return;
+            }
+
+            const formattedValue = valueFormatter(value);
+            tooltipContent += `<div class="flex items-center justify-between space-x-2">
+              <div class="flex items-center space-x-2">
+                <span class="inline-block size-2 rounded-sm" style="background-color: ${safeColor(param.color)}"></span>
+                ${(showLegend || cleanCategories.length > 1) ? `<span>${echartsEncode(param.seriesName)}</span>` : ""}
+              </div>
+              <span class="font-medium">${echartsEncode(formattedValue)}</span>
+            </div>`;
+
+            // Display confidence band if available
+            const item = dataByIndex[indexValue];
+            const origCat = categories[cleanCategories.indexOf(param.seriesName)] ?? param.seriesName;
+            const lowerVal = item ? (item[param.seriesName + "_band_lower"] ?? item[origCat + "_band_lower"]) : undefined;
+            const upperVal = item ? (item[param.seriesName + "_band_upper"] ?? item[origCat + "_band_upper"]) : undefined;
+            if (lowerVal !== undefined && lowerVal !== null && lowerVal !== "" && upperVal !== undefined && upperVal !== null && upperVal !== "") {
+              const formattedLower = valueFormatter(Number(lowerVal));
+              const formattedUpper = valueFormatter(Number(upperVal));
+              const bandColor = getBandColor(param.color, isDarkMode);
+
+              tooltipContent += `<div class="flex items-center justify-between space-x-2 pl-4 text-xs text-muted-foreground opacity-80 mt-0.5">
+                <div class="flex items-center space-x-2">
+                  <span class="inline-block size-2 rounded-sm" style="background-color: ${safeColor(bandColor)}"></span>
+                  <span>${echartsEncode(getNameIfSet(bandLowerName ?? "") ?? "")}</span>
+                </div>
+                <span class="font-medium">${echartsEncode(formattedLower)}</span>
+              </div>`;
+
+              tooltipContent += `<div class="flex items-center justify-between space-x-2 pl-4 text-xs text-muted-foreground opacity-80 mt-0.5">
+                <div class="flex items-center space-x-2">
+                  <span class="inline-block size-2 rounded-sm" style="background-color: ${safeColor(bandColor)}"></span>
+                  <span>${echartsEncode(getNameIfSet(bandUpperName ?? "") ?? "")}</span>
+                </div>
+                <span class="font-medium">${echartsEncode(formattedUpper)}</span>
+              </div>`;
+            }
+
+            const catExtraData = getExtraDataForCategory(param.seriesName);
+            if (catExtraData) {
+              Object.entries(catExtraData).forEach(([key, valueData]) => {
+                if (globalFields.has(key)) {
+                  return;
+                }
+                if (Array.isArray(valueData) && valueData.length >= 2) {
+                  const [value, columnType] = valueData;
+                  if (!value) {
+                    return;
+                  }
+                  tooltipContent += `<div class="flex items-center justify-between space-x-2 pl-4 text-xs text-muted-foreground opacity-80 mt-0.5">
+                    <span>${echartsEncode(key)}</span>
+                    <span class="font-medium">${echartsEncode(formatValue(value, columnType, true))}</span>
+                  </div>`;
+                }
+              });
+            }
+          });
+          tooltipContent += "</div>";
+
+          return tooltipContent;
+        },
+      },
+      legend: {
+        show: !isEmpty && showLegend,
+        data: cleanCategories,
+        selectedMode: false,
+        type: canFitLegendItems ? "plain" : "scroll",
+        orient: "horizontal",
+        left: chartPadding,
+        top: 7 + labelTopOffset + chartPadding,
+        padding: [5, canFitLegendItems ? legendPaddingRight : 25, 5, legendPaddingLeft],
+        textStyle: {
+          color: textColor,
+          fontFamily: chartFont,
+          fontWeight: 500,
+          width: canFitLegendItems ? legendItemWidth : undefined,
+          overflow: "truncate",
+        },
+        itemStyle: {
+          opacity: 1,
+          borderWidth: 0,
+        },
+        itemGap: legendItemGap,
+        itemHeight: 8,
+        itemWidth: 16,
+        pageButtonPosition: "end",
+        pageButtonGap: 10,
+        pageButtonItemGap: 5,
+        pageIconColor: textColorSecondary,
+        pageIconInactiveColor: borderColor,
+        pageIcons: {
+          horizontal: [
+            "M10.8284 12.0007L15.7782 16.9504L14.364 18.3646L8 12.0007L14.364 5.63672L15.7782 7.05093L10.8284 12.0007Z",
+            "M13.1717 12.0007L8.22192 7.05093L9.63614 5.63672L16.0001 12.0007L9.63614 18.3646L8.22192 16.9504L13.1717 12.0007Z",
+          ],
+        },
+        pageIconSize: 12,
+        pageFormatter: () => "",
+        pageTextStyle: {
+          fontSize: 1,
+        },
+        // Enable multi-row layout
+        width: "auto",
+        height: cleanCategories.length > 4 ? 40 : 20, // Allow more height for multi-row
+      },
+      grid: {
+        left: (cleanYAxisLabel ? 45 : 15) + chartPadding,
+        right: 16 + chartPadding + (cleanYAxisLabel ? 20 : 0),
+        top: 10 + legendTopOffset + labelTopOffset + chartPadding,
+        bottom: (cleanXAxisLabel ? 32 : 8) + chartPadding,
+        outerBoundsMode: "same",
+        outerBoundsContain: "axisLabel",
+      },
+      xAxis: {
+        type: isEmpty
+          ? ("category" as const)
+          : isTimestampData
+            ? ("time" as const)
+            : isNumericData
+              ? ("value" as const)
+              : ("category" as const),
+        data: isEmpty ? ["", "", "", "", ""] : xData,
+        show: true,
+        scale: !isEmpty && isNumericData ? true : undefined,
+        axisLabel: {
+          show: true,
+          customValues,
+          showMinLabel: true,
+          showMaxLabel: true,
+          formatter: (value: any) => {
+            if (isEmpty) {
+              return " ";
+            }
+            return toSingleLine(indexFormatter(indexType === "duration" || indexType === "time" ? new Date(value).getTime() : value, shortenLabel));
+          },
+          color: isEmpty ? "transparent" : textColorSecondary,
+          fontFamily: chartFont,
+          fontSize: 12,
+          interval: xData && !shouldRotateXLabel ? Math.floor((maxLabelLen / 13) * xData.length / (chartWidth / 80)) : undefined,
+          rotate: shouldRotateXLabel ? 45 : 0,
+          padding: [4, 8, 4, 8],
+          hideOverlap: true,
+        },
+        axisPointer: {
+          type: "line",
+          show: !isEmpty,
+          triggerOn: "mousemove",
+          lineStyle: {
+            color: referenceLineColor,
+            type: "solid",
+            width: 0.65,
+          },
+          label: {
+            show: true,
+            formatter: (params: any) => {
+              return toSingleLine(indexFormatter(indexType === "number" && params.value > 1 ? Math.round(params.value) : indexType === "duration" ? new Date(params.value).getTime() : params.value, xSpace / 5.8));
+            },
+            fontFamily: chartFont,
+            margin: 5,
+            color: textColorInverted,
+            backgroundColor: backgroundColorInverted,
+          },
+        },
+        axisLine: {
+          show: false,
+        },
+        axisTick: {
+          show: false,
+          customValues,
+        },
+        splitLine: {
+          show: false,
+        },
+        name: cleanXAxisLabel,
+        nameLocation: "middle",
+        nameGap: 36,
+        nameTextStyle: {
+          color: textColor,
+          fontFamily: chartFont,
+          fontWeight: 500,
+          fontSize: 12,
+        },
+      },
+      yAxis: {
+        type: "value" as const,
+        min: isEmpty ? 0 : undefined,
+        max: isEmpty ? 4 : undefined,
+        interval: isEmpty ? 1 : undefined,
+        show: true,
+        axisLabel: {
+          show: true,
+          formatter: (value: any) => {
+            if (isEmpty) {
+              return "000";
+            }
+            return toSingleLine(valueFormatter(value, true));
+          },
+          color: isEmpty ? "transparent" : textColorSecondary,
+          fontFamily: chartFont,
+          padding: [4, 8, 4, 8],
+          hideOverlap: true,
+        },
+        axisPointer: {
+          type: !isEmpty && data.length > 1 ? "line" : "none",
+          show: !isEmpty && data.length > 1,
+          triggerOn: "mousemove",
+          triggerEmphasis: false,
+          label: {
+            show: true,
+            formatter: (params: any) => {
+              return toSingleLine(valueFormatter(valueType === "number" && params.value > 1 ? Math.round(params.value) : params.value));
+            },
+            fontFamily: chartFont,
+            margin: 10,
+            color: textColorInverted,
+            backgroundColor: backgroundColorInverted,
+          },
+          lineStyle: {
+            color: referenceLineColor,
+            type: "solid",
+            width: 0.65,
+          },
+        },
+        axisLine: {
+          show: false,
+        },
+        axisTick: {
+          show: false,
+        },
+        splitLine: {
+          show: true,
+          lineStyle: {
+            color: borderColor,
+          },
+        },
+      },
+      // We use a graphic element to display the y-axis label instead of the axis name
+      // since the name can overlap with the axis labels.
+      // See https://github.com/apache/echarts/issues/12415#issuecomment-2285226567
+      graphic: {
+        type: "text",
+        rotation: Math.PI / 2,
+        y: (chartHeight + labelTopOffset + legendTopOffset - spaceForXaxisLabel) / 2,
+        x: 5 + chartPadding,
+        cursor: "default",
+        style: {
+          text: cleanYAxisLabel,
+          font: `500 12px ${chartFont}`,
+          fill: textColor,
+          width: chartHeight,
+          textAlign: "center",
+        },
+      },
+      series: isEmpty ? [] : series,
+    };
+  }, [
+    data,
+    dataByIndex,
+    categories,
+    colorsByCategory,
+    index,
+    indexType,
+    valueType,
+    valueFormatter,
+    indexFormatter,
+    showLegend,
+    xAxisLabel,
+    yAxisLabel,
+    extraDataByIndexAxis,
+    isDarkMode,
+    chartWidth,
+    chartHeight,
+    label,
+    subtitle,
+    markLines,
+    bandLowerName,
+    bandUpperName,
+    chartId,
+  ]);
+
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart || data.length === 0) {
+      return;
+    }
+    const { referenceLineColor } = getThemeColors(isDarkMode, chartId);
+    const series: LineSeriesOption[] = [{
+      id: "shaper-hover-reference-line",
+      type: "line" as const,
+      markLine: {
+        animationDuration: 100,
+        animationDurationUpdate: 100,
+        silent: true,
+        symbol: "none",
+        animation: false,
+        label: {
+          show: false,
+        },
+        lineStyle: {
+          color: referenceLineColor,
+          type: "solid",
+          width: 0.65,
+        },
+        data: isHovering != null && (data.length !== 1 || data[0][index] === isHovering) ? [{ xAxis: isHovering }] : [],
+      },
+    }];
+    chart.setOption({ series }, { lazyUpdate: true });
+  }, [
+    data,
+    index,
+    isDarkMode,
+    isHovering,
+    chartId,
+  ]);
+
+  // Event handlers for the EChart component
+  const chartEvents = React.useMemo(() => {
+    return {
+      // Add tooltip event handler
+      showTip: (params: any) => {
+        // Handle both dataIndex and axisValue approaches
+        let indexValue: any;
+
+        if (params.dataIndex !== undefined && params.seriesIndex !== undefined) {
+          // Use dataIndex if available
+          const dataIndex = params.dataIndex;
+          if (dataIndex >= 0 && dataIndex < data.length) {
+            indexValue = data[dataIndex][index];
+          }
+        } else if (params.axisValue !== undefined) {
+          // Use axisValue as fallback
+          indexValue = params.axisValue;
+        }
+
+        if (indexValue !== undefined) {
+          setHoverState(indexValue, chartId, indexType);
+        }
+      },
+      // Also handle tooltip hide to clear hover state
+      hideTip: () => {
+        if (hoveredChartIdRef.current === chartId) {
+          setHoverState(null, null, null);
+        }
+      },
+    };
+  }, [indexType, data, index, chartId, setHoverState]);
+
+  const handleChartReady = useCallback((chart: ECharts) => {
+    chartRef.current = chart;
+    setChartWidth(chart.getWidth());
+    setChartHeight(chart.getHeight());
+  }, []);
+
+  const handleChartResize = useCallback((chart: ECharts) => {
+    setChartWidth(chart.getWidth());
+    setChartHeight(chart.getHeight());
+  }, []);
+
+  return (
+    <div
+      className={cx("h-full w-full relative select-none overflow-hidden", className)}
+      {...other}
+    >
+      <EChart
+        className="relative h-full w-full"
+        option={chartOptions}
+        events={chartEvents}
+        onChartReady={handleChartReady}
+        onResize={handleChartResize}
+        data-chart-id={chartId}
+      />
+    </div>
+  );
+};
+
+LineChart.displayName = "LineChart";
+
+export { LineChart, type LineChartProps };

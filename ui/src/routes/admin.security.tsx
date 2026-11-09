@@ -1,0 +1,78 @@
+// SPDX-License-Identifier: MPL-2.0
+
+import { Button } from "../components/tremor/Button";
+import { useState } from "react";
+import {
+  createFileRoute,
+  isRedirect,
+  useNavigate,
+  redirect,
+} from "@tanstack/react-router";
+import { getSystemConfig } from "../lib/system";
+import { useToast } from "../hooks/useToast";
+import { useQueryApi } from "../hooks/useQueryApi";
+import { RiLockLine } from "@remixicon/react";
+
+export const Route = createFileRoute("/admin/security")({
+  loader: () => {
+    const config = getSystemConfig();
+    if (config.jwtSecretStatic) {
+      throw redirect({
+        to: config.apiKeysEnabled ? "/admin/keys" : !config.ssoLoginUrl ? "/admin" : "/",
+      });
+    }
+  },
+  component: Admin,
+});
+
+function Admin () {
+  const [isResetting, setIsResetting] = useState(false);
+  const { toast } = useToast();
+  const queryApi = useQueryApi();
+  const navigate = useNavigate({ from: "/admin" });
+
+  const handleReset = async () => {
+    setIsResetting(true);
+    try {
+      await queryApi("admin/reset-jwt-secret", {
+        method: "POST",
+      });
+      toast({
+        title: "Success",
+        description: "JWT secret reset successfully",
+      });
+    } catch (error) {
+      if (isRedirect(error)) {
+        return navigate(error.options);
+      }
+      toast({
+        title: "Error",
+        description:
+          error instanceof Error
+            ? error.message
+            : "An error occurred",
+        variant: "error",
+      });
+    } finally {
+      setIsResetting(false);
+    }
+  };
+
+  return (
+    <div>
+      <h2 className="text-xl font-semibold mb-4">
+        <RiLockLine className="size-4 inline mr-1 -mt-0.5" />
+        Security Settings
+      </h2>
+      <div className="space-y-4">
+        <div>
+          <h3 className="text-lg font-medium mb-2">JWT Secret</h3>
+          <p className="text-gray-600 dark:text-gray-400 mb-4">Reset the JWT secret to invalidate all existing tokens.</p>
+          <Button onClick={handleReset} disabled={isResetting} variant="destructive">
+            {isResetting ? "Resetting..." : "Reset JWT Secret"}
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}

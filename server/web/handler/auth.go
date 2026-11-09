@@ -1,0 +1,443 @@
+// SPDX-License-Identifier: MPL-2.0
+
+package handler
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"shaper/server/core"
+	"shaper/server/web/webutil"
+	"strings"
+	"time"
+
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v4/middleware"
+)
+
+const LONG_LIVED_TOKEN_DURATION = 30 * 24 * time.Hour
+
+func Logout(app *core.App) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		claims := c.Get("user").(*jwt.Token).Claims.(jwt.MapClaims)
+
+		// Only allow logout for user sessions
+		if _, hasAPIKey := claims["apiKeyId"]; hasAPIKey {
+			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "Cannot logout with API key"})
+		}
+
+		sessionID, ok := claims["sessionId"].(string)
+		if !ok || sessionID == "" {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "No session ID in token"})
+		}
+
+		if err := core.Logout(app, c.Request().Context(), sessionID); err != nil {
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Failed to delete session"})
+		}
+
+		return c.JSON(http.StatusOK, map[string]bool{"ok": true})
+	}
+}
+
+func Login(app *core.App, rateLimiter ...middleware.RateLimiterStore) echo.HandlerFunc {
+	var store middleware.RateLimiterStore
+	if len(rateLimiter) > 0 {
+		store = rateLimiter[0]
+	} else {
+		store = middleware.NewRateLimiterMemoryStoreWithConfig(middleware.RateLimiterMemoryStoreConfig{
+			Rate:      5.0 / 60.0,
+			Burst:     5,
+			ExpiresIn: 3 * time.Minute,
+		})
+	}
+	return func(c echo.Context) error {
+		// Parse the request body
+		var loginRequest struct {
+			Email    string `json:"email"`
+			Password string `json:"password"`
+		}
+		if err := c.Bind(&loginRequest); err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "Invalid request body"})
+		}
+
+		if store != nil {
+			ip := webutil.ExtractClientIP(c)
+			email := strings.ToLower(strings.TrimSpace(loginRequest.Email))
+			identifier := ip
+			if email != "" {
+				identifier = ip + ":" + email
+			}
+			allow, err := store.Allow(identifier)
+			if err != nil || !allow {
+				c.Response().Header().Set("Retry-After", "60")
+				return c.JSONPretty(http.StatusTooManyRequests, struct {
+					Error string `json:"error"`
+				}{Error: "Too many login attempts, please try again later"}, "  ")
+			}
+		}
+
+		// If a token is provided, validate it
+		sessionToken, err := core.Login(app, c.Request().Context(), loginRequest.Email, loginRequest.Password)
+		if err != nil {
+			return c.JSONPretty(http.StatusBadRequest, struct {
+				Error string `json:"error"`
+			}{Error: err.Error()}, "  ")
+		} else if sessionToken == "" {
+			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "Invalid email or password"})
+		}
+		return c.JSON(http.StatusOK, map[string]string{"token": sessionToken})
+	}
+}
+
+func validateVariables(mixedMap map[string]any) error {
+	for k, v := range mixedMap {
+		switch val := v.(type) {
+		case string:
+			continue
+		case []any:
+			for _, item := range val {
+				if _, ok := item.(string); !ok {
+					return fmt.Errorf("invalid type in array for key %s: %T", k, item)
+				}
+			}
+		default:
+			return fmt.Errorf("unsupported type for key %s: %T", k, v)
+		}
+	}
+	return nil
+}
+
+func TokenAuth(app *core.App) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		// Parse the request body
+		var loginRequest struct {
+			Token       string          `json:"token"`
+			DashboardID string          `json:"dashboardId"`
+			Variables   json.RawMessage `json:"variables"`
+			LongLived   bool            `json:"longLived"`
+		}
+		if err := c.Bind(&loginRequest); err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "Invalid request body"})
+		}
+
+		var varsMap map[string]any
+		hasVariablesField := loginRequest.Variables != nil
+		if hasVariablesField {
+			trimmed := strings.TrimSpace(string(loginRequest.Variables))
+			if trimmed != "null" && trimmed != "" {
+				if err := json.Unmarshal(loginRequest.Variables, &varsMap); err != nil {
+					return c.JSON(http.StatusBadRequest, map[string]string{"error": "Invalid variables format: " + err.Error()})
+				}
+				if err := validateVariables(varsMap); err != nil {
+					return c.JSON(http.StatusBadRequest, map[string]any{
+						"error":     "Invalid variables format: " + err.Error(),
+						"variables": varsMap,
+					})
+				}
+			}
+		}
+
+		// Check if the request is already authenticated via a valid JWT for a user and refresh if it is
+		authHeader := c.Request().Header.Get("Authorization")
+		tokenString := ""
+		if authHeader != "" {
+			tokenString = strings.TrimPrefix(authHeader, "Bearer ")
+			tokenString = strings.TrimSpace(tokenString)
+		} else if loginRequest.Token != "" && strings.HasPrefix(loginRequest.Token, "ey") && len(strings.Split(loginRequest.Token, ".")) == 3 {
+			// Old CLI clients might send JWTs as token in the body instead of as headers. Handle to support them
+			tokenString = loginRequest.Token
+		}
+
+		if tokenString != "" {
+			token, err := jwt.Parse(tokenString, func(t *jwt.Token) (any, error) {
+				if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+					return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
+				}
+				return app.JWTSecret, nil
+			})
+			if err == nil && token.Valid {
+				if claims, ok := token.Claims.(jwt.MapClaims); ok {
+					// Double check: dashboard-scoped JWTs cannot be used to exchange for new tokens.
+					if _, hasId := claims["dashboardId"]; hasId {
+						return c.JSONPretty(http.StatusUnauthorized, struct {
+							Error string `json:"error"`
+						}{Error: "Unauthorized"}, "  ")
+					}
+					if _, hasAPIKey := claims["apiKeyId"]; hasAPIKey && app.NoAPIKeys {
+						return c.JSONPretty(http.StatusUnauthorized, struct {
+							Error string `json:"error"`
+						}{Error: "Unauthorized"}, "  ")
+					}
+					var actor *core.Actor
+					if userId, ok := claims["userId"].(string); ok {
+						actor = &core.Actor{Type: core.ActorUser, ID: userId}
+					} else if apiKeyId, ok := claims["apiKeyId"].(string); ok {
+						actor = &core.Actor{Type: core.ActorAPIKey, ID: apiKeyId}
+					}
+					if actor != nil && !actor.HasPermission(c.Request().Context(), app.Sqlite, core.PermissionGenerateJWT) {
+						return c.JSON(http.StatusForbidden, map[string]string{"error": "Missing required permission: " + core.PermissionGenerateJWT})
+					}
+
+					isLongLived, _ := claims["longLived"].(bool)
+					if loginRequest.LongLived {
+						if isLongLived {
+							return c.JSONPretty(http.StatusUnauthorized, struct {
+								Error string `json:"error"`
+							}{Error: "Cannot generate a long-lived token from a long-lived token"}, "  ")
+						}
+					}
+
+					newClaims := jwt.MapClaims{}
+					for k, v := range claims {
+						if k != "exp" {
+							newClaims[k] = v
+						}
+					}
+
+					if loginRequest.LongLived {
+						newClaims["exp"] = time.Now().Add(LONG_LIVED_TOKEN_DURATION).Unix()
+						newClaims["longLived"] = true
+					} else {
+						if origExp, ok := claims["exp"]; ok {
+							newClaims["exp"] = origExp
+						} else {
+							newClaims["exp"] = time.Now().Add(app.JWTExp).Unix()
+						}
+					}
+					if loginRequest.DashboardID != "" {
+						newClaims["dashboardId"] = loginRequest.DashboardID
+					}
+					if hasVariablesField {
+						if len(varsMap) > 0 {
+							newClaims["variables"] = varsMap
+						} else {
+							delete(newClaims, "variables")
+						}
+					}
+					newToken := jwt.NewWithClaims(jwt.SigningMethodHS256, newClaims)
+					newTokenString, err := newToken.SignedString(app.JWTSecret)
+					if err != nil {
+						return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Failed to sign token"})
+					}
+					return c.JSON(http.StatusOK, map[string]string{"jwt": newTokenString})
+				}
+			}
+		}
+
+		// Check if the token is valid and get auth info
+		authInfo, err := core.ValidToken(app, c.Request().Context(), loginRequest.Token)
+		if err != nil {
+			return c.JSONPretty(http.StatusBadRequest, struct{ Error error }{Error: err}, "  ")
+		}
+		if !authInfo.Valid {
+			return c.JSON(http.StatusUnauthorized, map[string]string{"error": "Invalid token"})
+		}
+
+		// Check permission
+		var actor *core.Actor
+		if authInfo.IsUser {
+			actor = &core.Actor{Type: core.ActorUser, ID: authInfo.UserID}
+		} else if authInfo.APIKeyID != "" {
+			actor = &core.Actor{Type: core.ActorAPIKey, ID: authInfo.APIKeyID}
+		}
+
+		if actor != nil && !actor.HasPermission(c.Request().Context(), app.Sqlite, core.PermissionGenerateJWT) {
+			return c.JSON(http.StatusForbidden, map[string]string{"error": "Missing required permission: " + core.PermissionGenerateJWT})
+		}
+
+		expDuration := app.JWTExp
+		if loginRequest.LongLived {
+			expDuration = LONG_LIVED_TOKEN_DURATION
+		}
+
+		// Add user or API key info to claims
+		claims := jwt.MapClaims{
+			"exp": time.Now().Add(expDuration).Unix(),
+		}
+		if loginRequest.LongLived {
+			claims["longLived"] = true
+		}
+		if authInfo.IsUser {
+			claims["userId"] = authInfo.UserID
+			claims["userEmail"] = authInfo.UserEmail
+			claims["userName"] = authInfo.UserName
+			claims["sessionId"] = authInfo.SessionID
+		} else if authInfo.APIKeyID != "" {
+			claims["apiKeyId"] = authInfo.APIKeyID
+			claims["apiKeyName"] = authInfo.APIKeyName
+		}
+		if loginRequest.DashboardID == "" {
+			if authInfo.APIKeyID != "" {
+				return c.JSON(http.StatusBadRequest, map[string]string{"error": "Missing dashboardId"})
+			}
+		} else {
+			claims["dashboardId"] = loginRequest.DashboardID
+		}
+		if hasVariablesField && len(varsMap) > 0 {
+			claims["variables"] = varsMap
+		}
+
+		jwtToken := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+		signedToken, err := jwtToken.SignedString(app.JWTSecret)
+		if err != nil {
+			c.Logger().Error("Failed to sign token", slog.Any("error", err))
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Failed to sign token"})
+		}
+		return c.JSON(http.StatusOK, map[string]string{"jwt": signedToken})
+	}
+}
+
+func PublicAuth(app *core.App, rateLimiter ...middleware.RateLimiterStore) echo.HandlerFunc {
+	var store middleware.RateLimiterStore
+	if len(rateLimiter) > 0 {
+		store = rateLimiter[0]
+	} else {
+		store = middleware.NewRateLimiterMemoryStoreWithConfig(middleware.RateLimiterMemoryStoreConfig{
+			Rate:      20.0 / 60.0,
+			Burst:     10,
+			ExpiresIn: 3 * time.Minute,
+		})
+	}
+	return func(c echo.Context) error {
+		var loginRequest struct {
+			DashboardID string `json:"dashboardId"`
+			Password    string `json:"password,omitempty"`
+		}
+		if err := c.Bind(&loginRequest); err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "Invalid request body"})
+		}
+		if loginRequest.DashboardID == "" {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "Missing dashboardId"})
+		}
+
+		dashboard, err := core.GetDashboardInfo(app, c.Request().Context(), loginRequest.DashboardID)
+		if err != nil {
+			c.Logger().Error("error getting dashboard:", slog.Any("error", err))
+			return c.JSONPretty(http.StatusNotFound, struct {
+				Error string `json:"error"`
+			}{Error: "not found"}, "  ")
+		}
+		if dashboard.Visibility == nil ||
+			(*dashboard.Visibility == "private") ||
+			(app.NoPublicSharing && *dashboard.Visibility == "public") ||
+			(app.NoPasswordProtectedSharing && *dashboard.Visibility == "password-protected") {
+			return c.JSONPretty(http.StatusNotFound, struct {
+				Error string `json:"error"`
+			}{Error: "not found"}, "  ")
+		}
+
+		// If dashboard is password-protected, verify the password
+		if *dashboard.Visibility == "password-protected" {
+			if store != nil {
+				ip := webutil.ExtractClientIP(c)
+				identifier := ip + ":" + loginRequest.DashboardID
+				allow, err := store.Allow(identifier)
+				if err != nil || !allow {
+					c.Response().Header().Set("Retry-After", "60")
+					return c.JSONPretty(http.StatusTooManyRequests, struct {
+						Error string `json:"error"`
+					}{Error: "Too many requests, please try again later"}, "  ")
+				}
+			}
+
+			if loginRequest.Password == "" {
+				return c.JSONPretty(http.StatusUnauthorized, struct {
+					Error string `json:"error"`
+				}{Error: "Password required"}, "  ")
+			}
+
+			isValid, err := core.VerifyDashboardPassword(app, c.Request().Context(), loginRequest.DashboardID, loginRequest.Password)
+			if err != nil {
+				c.Logger().Error("error verifying password:", slog.Any("error", err))
+				return c.JSONPretty(http.StatusInternalServerError, struct {
+					Error string `json:"error"`
+				}{Error: "Internal server error"}, "  ")
+			}
+
+			if !isValid {
+				return c.JSONPretty(http.StatusUnauthorized, struct {
+					Error string `json:"error"`
+				}{Error: "Invalid password"}, "  ")
+			}
+		}
+
+		// Add user or API key info to claims
+		claims := jwt.MapClaims{
+			"exp":         time.Now().Add(app.JWTExp).Unix(),
+			"dashboardId": loginRequest.DashboardID,
+			"public":      *dashboard.Visibility,
+		}
+
+		jwtToken := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+		tokenString, err := jwtToken.SignedString(app.JWTSecret)
+		if err != nil {
+			c.Logger().Error("Failed to sign token", slog.Any("error", err))
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Failed to sign token"})
+		}
+		return c.JSON(http.StatusOK, map[string]string{"jwt": tokenString})
+	}
+}
+
+func Setup(app *core.App) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		if app.AdminEmail != "" {
+			return c.JSON(http.StatusConflict, map[string]string{"error": "User setup already completed"})
+		}
+
+		var setupRequest struct {
+			Email    string `json:"email"`
+			Name     string `json:"name"`
+			Password string `json:"password"`
+		}
+		if err := c.Bind(&setupRequest); err != nil {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "Invalid request body"})
+		}
+
+		if setupRequest.Email == "" {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "Email is required"})
+		}
+		if setupRequest.Password == "" {
+			return c.JSON(http.StatusBadRequest, map[string]string{"error": "Password is required"})
+		}
+
+		id, err := core.CreateAdminUser(app, c.Request().Context(), setupRequest.Email, setupRequest.Password, setupRequest.Name)
+		if err != nil {
+			if errors.Is(err, core.ErrUserSetupCompleted) {
+				return c.JSON(http.StatusConflict, map[string]string{"error": "User setup already completed"})
+			}
+			c.Logger().Error("Failed to create user", slog.Any("error", err))
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Failed to create user"})
+		}
+
+		token, err := core.CreateSessionForUser(app, c.Request().Context(), id)
+		if err != nil {
+			c.Logger().Error("Failed to create session during setup", slog.Any("error", err))
+			// We created the user, but failed to create a session.
+			// Return the ID anyway, user can login manually.
+			return c.JSON(http.StatusOK, map[string]string{"id": id})
+		}
+
+		return c.JSON(http.StatusOK, map[string]string{"id": id, "token": token})
+	}
+}
+
+func ResetJWTSecret(app *core.App) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		claims := c.Get("user").(*jwt.Token).Claims.(jwt.MapClaims)
+		// Double check: dashboard-scoped JWTs are also rejected centrally in routes.go middleware.
+		if _, hasId := claims["dashboardId"]; hasId {
+			return c.JSONPretty(http.StatusUnauthorized, struct {
+				Error string `json:"error"`
+			}{Error: "Unauthorized"}, "  ")
+		}
+		_, err := core.ResetJWTSecret(app, c.Request().Context())
+		if err != nil {
+			app.Logger.Error("Failed to reset JWT secret", slog.Any("error", err))
+			return c.JSON(http.StatusInternalServerError, map[string]string{"error": "Failed to reset JWT secret"})
+		}
+		return c.JSON(http.StatusOK, map[string]bool{"ok": true})
+	}
+}

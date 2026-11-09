@@ -1,0 +1,742 @@
+// SPDX-License-Identifier: MPL-2.0
+
+package dev
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io/fs"
+	"log/slog"
+	"net/http"
+	"os"
+	"path/filepath"
+	"shaper/server/api"
+	"shaper/server/core"
+	"shaper/server/web/handler"
+	"sort"
+	"strings"
+	"time"
+)
+
+const (
+	deployAPIKeyEnv = "SHAPER_DEPLOY_API_KEY"
+	noAuthActor     = "no_auth"
+)
+
+func DeployOnStartup(ctx context.Context, app *core.App, deployDir string) error {
+	if err := ensureDirExists(deployDir); err != nil {
+		return fmt.Errorf("deploy directory error: %w", err)
+	}
+
+	logger := app.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+
+	actor := &core.Actor{Type: core.ActorNoAuth, ID: "system"}
+	ctx = core.ContextWithActor(ctx, actor)
+
+	appsResp, err := core.ListApps(app, ctx, core.ListAppsOptions{
+		IncludeSubfolders: true,
+		IncludeContent:    true,
+		Path:              "/",
+	})
+	if err != nil {
+		return fmt.Errorf("failed to list existing apps from database: %w", err)
+	}
+
+	remoteApps := make([]api.App, 0, len(appsResp.Apps))
+	for _, a := range appsResp.Apps {
+		if a.Type == "dashboard" || a.Type == "task" {
+			remoteApps = append(remoteApps, a)
+		}
+	}
+
+	localApps, err := loadLocalApps(deployDir, logger)
+	if err != nil {
+		return fmt.Errorf("failed to load local apps from %s: %w", deployDir, err)
+	}
+
+	actorStr := actor.String()
+	if err := ensureRemoteFreshness(remoteApps, localApps, actorStr); err != nil {
+		return fmt.Errorf("freshness check failed: %w", err)
+	}
+
+	ops := buildDeployOperations(localApps, remoteApps)
+	if len(ops) == 0 {
+		logger.Info("Startup deploy: no changes detected; apps up to date", slog.String("dir", deployDir))
+		return nil
+	}
+
+	remoteAppsByID := make(map[string]api.App, len(remoteApps))
+	for _, a := range remoteApps {
+		remoteAppsByID[a.ID] = a
+	}
+
+	logger.Info("Startup deploy: applying changes", slog.Int("count", len(ops)), slog.String("dir", deployDir))
+	logDeployChangesWithLogger(logger, ops, localApps, remoteAppsByID)
+
+	for idx, op := range ops {
+		if _, err := handler.ProcessDeployOperation(ctx, app, idx, op); err != nil {
+			return fmt.Errorf("failed executing deploy operation %d: %w", idx, err)
+		}
+	}
+
+	logger.Info("Startup deploy completed successfully")
+	return nil
+}
+
+type LocalApp struct {
+	ID            string
+	Name          string
+	Type          string
+	Path          string
+	Content       string
+	FilePath      string
+	SyncTimestamp *time.Time
+}
+
+type deployHTTPClient interface {
+	appsRequester
+	Actor() string
+}
+
+func RunDeployCommand(ctx context.Context, configPath, urlOverride, authFile string, validateOnly bool) error {
+	cfg, err := LoadConfig(configPath, urlOverride)
+	if err != nil {
+		return err
+	}
+
+	watchDir, err := resolvePathRelativeToConfig(cfg.Directory, configPath)
+	if err != nil {
+		return fmt.Errorf("failed to resolve directory: %w", err)
+	}
+	if err := ensureDirExists(watchDir); err != nil {
+		return err
+	}
+
+	fmt.Printf("Deploying dashboards and tasks...\n\n")
+	fmt.Println("Current time: ", time.Now().Format(time.RFC3339))
+	fmt.Println()
+
+	systemCfg, err := fetchSystemConfig(ctx, cfg.URL)
+	if err != nil {
+		return err
+	}
+
+	apiKey := strings.TrimSpace(os.Getenv(deployAPIKeyEnv))
+
+	var client deployHTTPClient
+	switch {
+	case apiKey != "":
+		client, err = newAPIKeyClient(cfg.URL, apiKey)
+		if err != nil {
+			return err
+		}
+	default:
+		authFilePath, err := resolvePathRelativeToConfig(authFile, configPath)
+		if err != nil {
+			return fmt.Errorf("failed to resolve auth file path: %w", err)
+		}
+		authManager := NewAuthManager(ctx, cfg.URL, authFilePath, systemCfg.LoginRequired)
+		if systemCfg.LoginRequired {
+			if err := authManager.EnsureSession(); err != nil {
+				return fmt.Errorf("deploy failed: no API key found in %s and user authentication failed: %w", deployAPIKeyEnv, err)
+			}
+		}
+		client, err = NewAPIClient(ctx, cfg.URL, authManager)
+		if err != nil {
+			return fmt.Errorf("failed to initialize API client for deploy: %w", err)
+		}
+	}
+	fmt.Println("Fetching remote apps from", cfg.URL)
+	remoteApps, err := fetchAllApps(ctx, client)
+	if err != nil {
+		return fmt.Errorf("failed to fetch apps: %w", err)
+	}
+	fmt.Printf("Found %d remote apps.\n", len(remoteApps))
+
+	fmt.Println("Loading apps from folder", watchDir)
+	localApps, err := loadLocalApps(watchDir, nil)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Found %d local apps.\n", len(localApps))
+
+	remoteAppsByID := make(map[string]api.App, len(remoteApps))
+	for _, app := range remoteApps {
+		if app.Type == "dashboard" || app.Type == "task" {
+			remoteAppsByID[app.ID] = app
+		}
+	}
+
+	if err := ensureRemoteFreshness(remoteApps, localApps, client.Actor()); err != nil {
+		return err
+	}
+
+	ops := buildDeployOperations(localApps, remoteApps)
+	if len(ops) == 0 {
+		fmt.Printf("\nNo changes detected; nothing to deploy.\n")
+		return nil
+	}
+
+	var createCount, updateCount, deleteCount int
+	for _, op := range ops {
+		switch op.Operation {
+		case "create":
+			createCount++
+		case "update":
+			updateCount++
+		case "delete":
+			deleteCount++
+		}
+	}
+
+	fmt.Printf("\nChanges: create=%d, update=%d, delete=%d\n\n", createCount, updateCount, deleteCount)
+	logDeployChanges(ops, localApps, remoteAppsByID)
+
+	if validateOnly {
+		fmt.Printf("\nValidation successful. No changes have been applied (validate-only mode).\n")
+		return nil
+	}
+
+	if err := submitDeploy(ctx, client, ops); err != nil {
+		return err
+	}
+
+	fmt.Printf("\nDeploy completed.\n")
+
+	// Fetch remote apps again to update local shapersync timestamps and avoid forcing users to pull after every deploy.
+	fmt.Println("Updating local shapersync timestamps...")
+	newRemoteApps, err := fetchAllApps(ctx, client)
+	if err != nil {
+		fmt.Printf("WARNING: Failed to fetch remote apps to update local shapersync timestamps: %s\n", err)
+	} else {
+		newRemoteByID := make(map[string]api.App, len(newRemoteApps))
+		for _, app := range newRemoteApps {
+			if app.Type == "dashboard" || app.Type == "task" {
+				newRemoteByID[app.ID] = app
+			}
+		}
+
+		updatedCount := 0
+		for _, op := range ops {
+			if op.Operation == "create" || op.Operation == "update" {
+				if op.Data.ID == nil {
+					continue
+				}
+				id := *op.Data.ID
+				if remoteApp, exists := newRemoteByID[id]; exists {
+					if localApp, localExists := localApps[id]; localExists {
+						contentBytes, err := os.ReadFile(localApp.FilePath)
+						if err == nil {
+							truncatedTime := remoteApp.UpdatedAt.Truncate(time.Second)
+							newContent := prependAppMetadata(localApp.ID, &truncatedTime, stripAppMetadata(string(contentBytes)))
+							if err := os.WriteFile(localApp.FilePath, []byte(newContent), 0o644); err == nil {
+								updatedCount++
+							} else {
+								fmt.Printf("WARNING: Failed to write updated shapersync timestamp to %s: %s\n", localApp.FilePath, err)
+							}
+						}
+					}
+				}
+			}
+		}
+		if updatedCount > 0 {
+			fmt.Printf("Successfully updated shapersync timestamps for %d local files.\n", updatedCount)
+		}
+	}
+
+	return nil
+}
+
+func loadLocalApps(baseDir string, logger *slog.Logger) (map[string]LocalApp, error) {
+	apps := make(map[string]LocalApp)
+	err := filepath.WalkDir(baseDir, func(p string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.IsDir() {
+			return nil
+		}
+
+		isDashboard := strings.HasSuffix(d.Name(), DASHBOARD_SUFFIX)
+		isTask := strings.HasSuffix(d.Name(), TASK_SUFFIX)
+
+		if !isDashboard && !isTask {
+			if strings.HasSuffix(d.Name(), ".sql") {
+				if logger != nil {
+					logger.Warn("File ends with .sql but not with dashboard or task suffix; ignoring", slog.String("file", p))
+				} else {
+					fmt.Printf("WARNING: %s ends with .sql but not with %s or %s; ignoring\n", p, DASHBOARD_SUFFIX, TASK_SUFFIX)
+				}
+			}
+			return nil
+		}
+
+		contentBytes, err := os.ReadFile(p)
+		if err != nil {
+			return fmt.Errorf("failed to read %s: %w", p, err)
+		}
+		content := string(contentBytes)
+		meta := extractAppMetadata(content)
+		if meta.ID == "" {
+			return fmt.Errorf("%s is missing a shaper id comment (run `shaper ids` to generate)", p)
+		}
+
+		if _, exists := apps[meta.ID]; exists {
+			return fmt.Errorf("duplicate app id %s found in %s and %s", meta.ID, apps[meta.ID].FilePath, p)
+		}
+
+		relDir, err := filepath.Rel(baseDir, filepath.Dir(p))
+		if err != nil {
+			return fmt.Errorf("failed to determine relative path for %s: %w", p, err)
+		}
+
+		appType := "dashboard"
+		name := strings.TrimSuffix(d.Name(), DASHBOARD_SUFFIX)
+		if isTask {
+			appType = "task"
+			name = strings.TrimSuffix(d.Name(), TASK_SUFFIX)
+		}
+
+		apps[meta.ID] = LocalApp{
+			ID:            meta.ID,
+			Name:          name,
+			Type:          appType,
+			Path:          normalizeDashboardPath(relDir),
+			Content:       content,
+			FilePath:      p,
+			SyncTimestamp: meta.SyncTimestamp,
+		}
+		return nil
+	})
+
+	return apps, err
+}
+
+func normalizeDashboardPath(relDir string) string {
+	if relDir == "." {
+		return "/"
+	}
+	normalized := filepath.ToSlash(relDir)
+	if !strings.HasPrefix(normalized, "/") {
+		normalized = "/" + normalized
+	}
+	if !strings.HasSuffix(normalized, "/") {
+		normalized += "/"
+	}
+	return normalized
+}
+
+// stripAppMetadata removes the ID and SyncTime prefixes, their newlines, and the following empty line from content.
+func stripAppMetadata(content string) string {
+	lines := strings.Split(content, "\n")
+	var newLines []string
+	inMetadata := true
+	hadMetadata := false
+	for i, line := range lines {
+		trimmedLine := strings.TrimSpace(line)
+		if inMetadata && (strings.HasPrefix(trimmedLine, shaperIDPrefix) || strings.HasPrefix(trimmedLine, shaperSyncPrefix)) {
+			hadMetadata = true
+			continue
+		}
+		if inMetadata {
+			inMetadata = false
+			// Only skip the empty line if we actually stripped some metadata beforehand
+			if hadMetadata && trimmedLine == "" && len(newLines) == 0 && i < len(lines)-1 {
+				continue
+			}
+		}
+		newLines = append(newLines, line)
+	}
+	return strings.Join(newLines, "\n")
+}
+
+func ensureRemoteFreshness(remote []api.App, local map[string]LocalApp, actor string) error {
+	for _, app := range remote {
+		if app.Type != "dashboard" && app.Type != "task" {
+			continue
+		}
+
+		localApp, exists := local[app.ID]
+		willBeModified := !exists || appsDiffer(localApp, app)
+		if !willBeModified {
+			continue
+		}
+
+		updatedBy := ""
+		if app.UpdatedBy != nil {
+			updatedBy = *app.UpdatedBy
+		}
+
+		// If the app was updated after our local sync timestamp, we normally want to force a pull first.
+		// If no sync timestamp exists locally, we MUST assume it's stale if we want to protect against overwriting Prod.
+		isStale := false
+		if localApp.SyncTimestamp != nil {
+			isStale = app.UpdatedAt.Truncate(time.Second).After(*localApp.SyncTimestamp)
+		} else {
+			isStale = true
+		}
+
+		// If the remote app was last updated by the exact same actor (e.g. CI deployment key or same user),
+		// we know the changes are coming from ourselves and it is not an out-of-band manual edit in the UI.
+		if isStale && updatedBy == actor {
+			isStale = false
+		}
+
+		if isStale {
+			return fmt.Errorf("remote app %s (%s) was updated in prod by %s; run `shaper pull` first", app.Name, app.ID, updatedBy)
+		}
+	}
+	return nil
+}
+
+func buildDeployOperations(local map[string]LocalApp, remote []api.App) []api.AppRequest {
+	remoteByID := make(map[string]api.App, len(remote))
+	for _, r := range remote {
+		if r.Type == "dashboard" || r.Type == "task" {
+			remoteByID[r.ID] = r
+		}
+	}
+
+	var createOps []api.AppRequest
+	var updateOps []api.AppRequest
+	var deleteOps []api.AppRequest
+
+	localList := make([]LocalApp, 0, len(local))
+	for _, l := range local {
+		localList = append(localList, l)
+	}
+	sort.Slice(localList, func(i, j int) bool {
+		if localList[i].Path == localList[j].Path {
+			return localList[i].Name < localList[j].Name
+		}
+		return localList[i].Path < localList[j].Path
+	})
+
+	for _, localApp := range localList {
+		if remoteApp, ok := remoteByID[localApp.ID]; ok {
+			if appsDiffer(localApp, remoteApp) {
+				name := localApp.Name
+				path := localApp.Path
+				content := stripAppMetadata(localApp.Content)
+				id := localApp.ID
+				updateOps = append(updateOps, api.AppRequest{
+					Operation: "update",
+					Type:      localApp.Type,
+					Data: api.DashboardData{
+						ID:      &id,
+						Name:    &name,
+						Path:    &path,
+						Content: &content,
+					},
+				})
+			}
+			continue
+		}
+
+		name := localApp.Name
+		path := localApp.Path
+		content := stripAppMetadata(localApp.Content)
+		id := localApp.ID
+		createOps = append(createOps, api.AppRequest{
+			Operation: "create",
+			Type:      localApp.Type,
+			Data: api.DashboardData{
+				ID:      &id,
+				Name:    &name,
+				Path:    &path,
+				Content: &content,
+			},
+		})
+	}
+
+	remoteList := make([]api.App, 0, len(remoteByID))
+	for _, r := range remoteByID {
+		remoteList = append(remoteList, r)
+	}
+	sort.Slice(remoteList, func(i, j int) bool {
+		if remoteList[i].Path == remoteList[j].Path {
+			return remoteList[i].Name < remoteList[j].Name
+		}
+		return remoteList[i].Path < remoteList[j].Path
+	})
+
+	for _, remoteApp := range remoteList {
+		if _, ok := local[remoteApp.ID]; ok {
+			continue
+		}
+		id := remoteApp.ID
+		deleteOps = append(deleteOps, api.AppRequest{
+			Operation: "delete",
+			Type:      remoteApp.Type,
+			Data: api.DashboardData{
+				ID: &id,
+			},
+		})
+	}
+
+	var ops []api.AppRequest
+	ops = append(ops, deleteOps...)
+	ops = append(ops, updateOps...)
+	ops = append(ops, createOps...)
+
+	return ops
+}
+
+func appsDiffer(local LocalApp, remote api.App) bool {
+	if local.Name != remote.Name {
+		return true
+	}
+	if local.Path != normalizeDashboardPath(strings.TrimPrefix(remote.Path, "/")) {
+		return true
+	}
+	// Compare content without the ID prefix (local has it, remote doesn't)
+	localContent := stripAppMetadata(local.Content)
+	return localContent != remote.Content
+}
+
+func logDeployChanges(ops []api.AppRequest, local map[string]LocalApp, remote map[string]api.App) {
+	for _, op := range ops {
+		var (
+			currentPath string
+			currentName string
+			appType     string
+		)
+
+		if op.Data.ID != nil {
+			if localApp, ok := local[*op.Data.ID]; ok {
+				currentPath = localApp.Path
+				currentName = localApp.Name
+				appType = localApp.Type
+			}
+		}
+		if currentPath == "" && op.Data.Path != nil {
+			currentPath = *op.Data.Path
+		}
+		if currentName == "" && op.Data.Name != nil {
+			currentName = *op.Data.Name
+		}
+		if appType == "" {
+			appType = op.Type
+		}
+
+		var prev api.App
+		var hasPrev bool
+		if op.Data.ID != nil {
+			prev, hasPrev = remote[*op.Data.ID]
+		}
+		if currentPath == "" && hasPrev {
+			currentPath = prev.Path
+		}
+		if currentName == "" && hasPrev {
+			currentName = prev.Name
+		}
+		if appType == "" && hasPrev {
+			appType = prev.Type
+		}
+
+		extra := ""
+		if hasPrev && op.Operation != "delete" {
+			extra = " (last_updated=" + prev.UpdatedAt.Format(time.RFC3339)
+			if prev.Path != currentPath {
+				extra += fmt.Sprintf(", previous_path=%s", prev.Path)
+			}
+			if prev.Name != currentName {
+				extra += fmt.Sprintf(", previous_name=%s", prev.Name)
+			}
+			extra += ")"
+		}
+
+		opID := "unknown"
+		if op.Data.ID != nil {
+			opID = *op.Data.ID
+		}
+
+		suffix := DASHBOARD_SUFFIX
+		if appType == "task" {
+			suffix = TASK_SUFFIX
+		}
+
+		fmt.Printf("%s %s: %s%s%s%s\n", op.Operation, opID, currentPath, currentName, suffix, extra)
+	}
+}
+
+func logDeployChangesWithLogger(logger *slog.Logger, ops []api.AppRequest, local map[string]LocalApp, remote map[string]api.App) {
+	for _, op := range ops {
+		var (
+			currentPath string
+			currentName string
+			appType     string
+		)
+
+		if op.Data.ID != nil {
+			if localApp, ok := local[*op.Data.ID]; ok {
+				currentPath = localApp.Path
+				currentName = localApp.Name
+				appType = localApp.Type
+			}
+		}
+		if currentPath == "" && op.Data.Path != nil {
+			currentPath = *op.Data.Path
+		}
+		if currentName == "" && op.Data.Name != nil {
+			currentName = *op.Data.Name
+		}
+		if appType == "" {
+			appType = op.Type
+		}
+
+		var prev api.App
+		var hasPrev bool
+		if op.Data.ID != nil {
+			prev, hasPrev = remote[*op.Data.ID]
+		}
+		if currentPath == "" && hasPrev {
+			currentPath = prev.Path
+		}
+		if currentName == "" && hasPrev {
+			currentName = prev.Name
+		}
+		if appType == "" && hasPrev {
+			appType = prev.Type
+		}
+
+		opID := "unknown"
+		if op.Data.ID != nil {
+			opID = *op.Data.ID
+		}
+
+		suffix := DASHBOARD_SUFFIX
+		if appType == "task" {
+			suffix = TASK_SUFFIX
+		}
+
+		appFilePath := currentPath + currentName + suffix
+		attrs := []any{
+			slog.String("operation", op.Operation),
+			slog.String("id", opID),
+			slog.String("path", appFilePath),
+		}
+		if hasPrev && op.Operation != "delete" {
+			attrs = append(attrs, slog.Time("last_updated", prev.UpdatedAt))
+			if prev.Path != currentPath {
+				attrs = append(attrs, slog.String("previous_path", prev.Path))
+			}
+			if prev.Name != currentName {
+				attrs = append(attrs, slog.String("previous_name", prev.Name))
+			}
+		}
+
+		logger.Info("Deploy operation", attrs...)
+	}
+}
+
+func submitDeploy(ctx context.Context, client deployHTTPClient, ops []api.AppRequest) error {
+	body, err := json.Marshal(api.Request{Apps: ops})
+	if err != nil {
+		return fmt.Errorf("failed to marshal deploy request: %w", err)
+	}
+
+	resp, err := client.DoRequest(ctx, http.MethodPost, "/api/deploy", body)
+	if err != nil {
+		return fmt.Errorf("deploy request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return decodeAPIError(resp)
+	}
+
+	return nil
+}
+
+type apiKeyClient struct {
+	baseURL    string
+	httpClient *http.Client
+	apiKey     string
+	actor      string
+}
+
+func newAPIKeyClient(baseURL, apiKey string) (*apiKeyClient, error) {
+	_, actor, err := parseAPIKeyActor(apiKey)
+	if err != nil {
+		return nil, err
+	}
+
+	return &apiKeyClient{
+		baseURL: strings.TrimSuffix(baseURL, "/"),
+		httpClient: &http.Client{
+			Timeout: 300 * time.Second,
+		},
+		apiKey: apiKey,
+		actor:  actor,
+	}, nil
+}
+
+func (c *apiKeyClient) DoRequest(ctx context.Context, method, path string, body []byte) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("failed to build request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+func (c *apiKeyClient) Actor() string {
+	return c.actor
+}
+
+type openDeployClient struct {
+	baseURL    string
+	httpClient *http.Client
+}
+
+func newOpenDeployClient(baseURL string) *openDeployClient {
+	fmt.Printf("Using unauthenticated deploy client.\n\n")
+	return &openDeployClient{
+		baseURL: strings.TrimSuffix(baseURL, "/"),
+		httpClient: &http.Client{
+			Timeout: 300 * time.Second,
+		},
+	}
+}
+
+func (c *openDeployClient) Actor() string {
+	return noAuthActor
+}
+
+func (c *openDeployClient) DoRequest(ctx context.Context, method, path string, body []byte) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("failed to build request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+func parseAPIKeyActor(key string) (string, string, error) {
+	parts := strings.Split(key, ".")
+	if len(parts) < 3 {
+		return "", "", fmt.Errorf("invalid API key format; expected {prefix}.{key_id}.{random}")
+	}
+	keyID := strings.TrimSpace(parts[1])
+	if keyID == "" {
+		return "", "", fmt.Errorf("invalid API key format; missing key_id component")
+	}
+	return keyID, fmt.Sprintf("api_key:%s", keyID), nil
+}
